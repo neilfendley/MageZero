@@ -1,34 +1,64 @@
 import torch
+import os
+import train
 
-# 1. Load your trained model (adjust paths / class as needed)
-from train import Net  # or wherever your Net class lives
+# These constants must match the parameters used to train the model you are exporting.
+# The GLOBAL_MAX defines the size of the embedding layer's weight matrix.
 
-# replace these with your actual sizes
-STATE_DIM  = 4000
-ACTION_DIM = 128    # or whatever your policy head produces
+# Define the output path and ensure the directory exists
+output_dir = "exports/UWTempo2/ver3" # Example directory
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, "Model.onnx")
 
-# instantiate and load checkpoint
-model = Net(STATE_DIM, ACTION_DIM)
-checkpoint = torch.load("models/ckpt_40.pt", map_location="cpu")
-model.load_state_dict(checkpoint)
+# --- Model Loading ---
+# Instantiate the model with the correct (large) vocabulary size
+model = train.Net(train.GLOBAL_MAX, train.ACTIONS_MAX)
+
+# Load the desired checkpoint
+checkpoint_path = "models/ckpt_20.pt" # IMPORTANT: Use your best/final checkpoint
+try:
+    model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
+    print(f"Successfully loaded checkpoint from {checkpoint_path}")
+except FileNotFoundError:
+    print(f"ERROR: Checkpoint file not found at {checkpoint_path}. Exporting an uninitialized model.")
+except Exception as e:
+    print(f"ERROR: Failed to load checkpoint. {e}. Exporting an uninitialized model.")
+
+# Set the model to evaluation mode (important for layers like Dropout, etc.)
 model.eval()
 
-# 2. Create a dummy input with the right batch shape
-dummy_input = torch.randn(1, STATE_DIM, dtype=torch.float32)
+# 2. Create dummy inputs that match the new model's forward(indices, offsets) signature
+#    This represents a single sample (batch size = 1) with 4 active feature indices.
+#    The indices must be LongTensors (int64).
+dummy_indices = torch.LongTensor([10, 20, 150, 4000]) # Example active feature indices
+dummy_offsets = torch.LongTensor([0])                # For a batch of 1, the offset starts at index 0
 
-# 3. Export to ONNX
+# The input to the export function must be a tuple containing all positional arguments
+dummy_input_tuple = (dummy_indices, dummy_offsets)
+
+# 3. Export to ONNX with updated input names and dynamic axes
+print(f"Exporting model to {output_path}...")
 torch.onnx.export(
     model,
-    dummy_input,
-    "exports/UWTempo/ver2/Model.onnx",
-    input_names=["state_input"],
-    output_names=["policy", "value"],
+    dummy_input_tuple,
+    output_path,
+    input_names=["indices", "offsets"],  # MUST match the names in NeuralNetEvaluator.java
+    output_names=["policy", "value"],    # MUST match the names in NeuralNetEvaluator.java
     dynamic_axes={
-        "state_input": {0: "batch_size"},
-        "policy":      {0: "batch_size"},
-        "value":       {0: "batch_size"}
+        "indices": {0: "num_total_indices"}, # The length of this tensor is variable
+        "offsets": {0: "batch_size"},        # The batch size is variable
+        "policy":  {0: "batch_size"},        # The batch size is variable
+        "value":   {0: "batch_size"}         # The batch size is variable
     },
-    opset_version=13,
+    opset_version=13, # Using a reasonably modern opset is good practice
     do_constant_folding=True
 )
+
+print("Model exported successfully.")
+print("\n--- ONNX Model Input/Output Summary ---")
+print(f"Input 1 Name: 'indices' (dynamic length)")
+print(f"Input 2 Name: 'offsets' (dynamic length = batch_size)")
+print(f"Output 1 Name: 'policy'")
+print(f"Output 2 Name: 'value'")
+print("\nEnsure these names match the final String fields in your NeuralNetEvaluator.java")
 

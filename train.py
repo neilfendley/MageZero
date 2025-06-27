@@ -38,7 +38,7 @@ class Net(nn.Module):
 
 
 def train():
-    ds = LabeledStateDataset("data/UWTempo2/ver1/training.bin")
+    ds = LabeledStateDataset("data/UWTempo2/ver3/training.bin")
     #ds.states = ds.states.mul(2.0).sub(1.0) #fix activations
     dl = DataLoader(ds, batch_size=128, shuffle=True, num_workers=4, collate_fn=collate_batch)
     model = Net(GLOBAL_MAX, ACTIONS_MAX).cuda()

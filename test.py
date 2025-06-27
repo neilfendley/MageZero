@@ -9,7 +9,7 @@ from dataset import LabeledStateDataset, collate_batch  # CRITICAL: Import colla
 
 def test():
 
-    ds = LabeledStateDataset("data/UWTempo2/ver1/training.bin")
+    ds = LabeledStateDataset("data/UWTempo2/ver3/testing.bin")
 
     dl = DataLoader(ds, batch_size=128, shuffle=False, num_workers=4, collate_fn=collate_batch)
 

@@ -100,7 +100,7 @@ if __name__ == "__main__":
 
     # Assuming LabeledStateDataset and collate_batch are defined above in the same file
 
-    path = sys.argv[1] if len(sys.argv) > 1 else "data/UWTempo2/ver1/training.bin"  # Ensure this path is correct
+    path = sys.argv[1] if len(sys.argv) > 1 else "data/UWTempo2/ver2/training.bin"  # Ensure this path is correct
     ds = LabeledStateDataset(path)
     print(f"Dataset size: {len(ds)}")
     print(f"Global Vocabulary Size (S) from header: {ds.S}")

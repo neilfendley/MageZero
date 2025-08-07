@@ -23,19 +23,28 @@ Test policy_accuracy=0.732
 
 
 #gen0:
--samples: 250 (games)
--wr: 18.4%
--best epoch: 7
--policy acc: 85%
--value loss: 0.058
+-samples: 1000 (games)
+Loaded checkpoint from models/model3/ckpt_14.pt
+Test policy_loss=0.362  value_loss=0.037
+Test policy_accuracy=0.889
+-samples: 250
+Loaded checkpoint from models/model2/ckpt_13.pt
+Test policy_loss=0.438  value_loss=0.039
+Test policy_accuracy=0.865
+
 #gen1:
 -samples: 250
 -wr: 16%
--best epoch: 26
--policy acc: 88%
--value loss: 0.058
+Loaded checkpoint from models/model3/ckpt_8.pt
+Test policy_loss=0.399  value_loss=0.054
+Test policy_accuracy=0.862
 #gen2:
 -wr: 18%
 -best epoch:
 -policy acc:
 -value loss:
+
+
+gen0 wr: 16%
+gen1 wr: 8/250 (3.2%)
+gen1 wr

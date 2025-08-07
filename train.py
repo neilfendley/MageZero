@@ -2,18 +2,18 @@ import torch
 import torch.nn.functional as F
 from torch import nn, optim
 from torch.utils.data import ConcatDataset, DataLoader, Subset
-from dataset import LabeledStateDataset, collate_batch
+from dataset import LabeledStateDataset, collate_batch, load_dataset_from_directory
 from typing import Set, List, Tuple
 ACTIONS_MAX = 128
 GLOBAL_MAX = 100000
-IS_MCTS = False
+EPOCH_COUNT = 10
 
 
 class Net(nn.Module):
     def __init__(self, num_embeddings, policy_size_A):
         super().__init__()
 
-        embedding_dim = 1024  # Output of EmbeddingBag, matches your original fc1 output
+        embedding_dim = 512  # Output of EmbeddingBag, matches your original fc1 output
         hidden_dim_mlp = 256  # Output of the main MLP block, matches your original fc2 output
 
         self.embedding_bag = nn.EmbeddingBag(
@@ -40,7 +40,7 @@ class Net(nn.Module):
 
     def forward(self, indices, offsets):
         emb = self.embedding_bag(indices, offsets)
-        emb = self.embedding_dropout(emb)
+        #emb = self.embedding_dropout(emb)
         emb = self.embedding_norm(emb + self.embedding_bias)
         h = self.fc_after_embedding(emb)
         return self.policy_head(h), self.value_head(h).squeeze(-1)
@@ -48,9 +48,9 @@ class Net(nn.Module):
 
 
 def train():
-    ds1 = LabeledStateDataset("data/UWTempo/ver3/training.bin")
-    #ds2 = LabeledStateDataset("data/UWTempo/ver3/training.bin")
-    combined_ds = ds1 #Subset(ds1, range(0,2000)) #ConcatDataset([ds1, ds2])
+
+    combined_ds = load_dataset_from_directory("data/UWTempo/ver3/training")
+    #combined_ds = LabeledStateDataset("data/UWTempo/ver3/training/training.bin")
     dl = DataLoader(combined_ds, batch_size=128, shuffle=True, num_workers=4, collate_fn=collate_batch)
     model = Net(GLOBAL_MAX, ACTIONS_MAX).cuda()
 
@@ -65,7 +65,7 @@ def train():
             dense_params.append(param)
     opt_dense = optim.Adam(dense_params, lr=5e-4)
 
-    checkpoint_path = f"models/model0/ckpt_15.pt"  # Example: Starting from ckpt_16
+    checkpoint_path = f"models/model0/ckpt_11.pt"  # Example: Starting from ckpt_16
 
     try:
         checkpoint = torch.load(checkpoint_path, map_location="cuda")
@@ -85,11 +85,9 @@ def train():
 
     ce = nn.CrossEntropyLoss()
     mse = nn.MSELoss()
-    #for mcts
-    kld_loss = nn.KLDivLoss(reduction="batchmean")
 
 
-    for epoch in range(1, 21):
+    for epoch in range(1, EPOCH_COUNT+1):
         total_p_loss, total_v_loss = 0.0, 0.0  # Initialize as floats
         model.train()
 
@@ -104,12 +102,8 @@ def train():
             # 6. Model call uses indices and offsets
             policy_logits, value_pred = model(batch_indices, batch_offsets)
 
-            if IS_MCTS:
-                log_policy_probs = F.log_softmax(policy_logits, dim=1)
-                lp = kld_loss(log_policy_probs, batch_policy_labels)
-            else:
-                policy_target_indices = torch.argmax(batch_policy_labels, dim=1)
-                lp = ce(policy_logits, policy_target_indices)
+            policy_target_indices = torch.argmax(batch_policy_labels, dim=1)
+            lp = ce(policy_logits, batch_policy_labels)
 
             lv = mse(value_pred, batch_value_labels.squeeze(-1))  # Ensure batch_value_labels is shape [batch_size]
             loss = lp + lv

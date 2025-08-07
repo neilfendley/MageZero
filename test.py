@@ -6,11 +6,12 @@ from torch.utils.data import DataLoader
 # If Net is also in dataset.py or a separate model.py, adjust import accordingly.
 import train  # Or from train import Net, ACTIONS_MAX (if ACTIONS_MAX is defined there)
 from dataset import LabeledStateDataset, collate_batch  # CRITICAL: Import collate_batch
+from train import EPOCH_COUNT
 
 
 def validate():
 
-    test_ds = "data/UWTempo/ver3/testing.bin"
+    test_ds = "data/UWTempo/ver3/testing/testing2.bin"
     ds = LabeledStateDataset(test_ds)
     dl = DataLoader(ds, batch_size=128, shuffle=False, num_workers=4, collate_fn=collate_batch)
 
@@ -21,11 +22,10 @@ def validate():
 
     ce = nn.CrossEntropyLoss()
     mse = nn.MSELoss()
-    # for mcts
-    kld_loss = nn.KLDivLoss(reduction="batchmean")
 
-    for i in range(1, 21):
-        checkpoint_path = f"models/model3/ckpt_{i}.pt"  # Make sure this is the correct checkpoint
+
+    for i in range(1, train.EPOCH_COUNT+1):
+        checkpoint_path = f"models/model2/ckpt_{i}.pt"  # Make sure this is the correct checkpoint
         try:
             checkpoint = torch.load(checkpoint_path, map_location="cuda")
             model.load_state_dict(checkpoint['model_state_dict'])
@@ -56,11 +56,8 @@ def validate():
                 policy_target_indices = torch.argmax(batch_policy_labels, dim=1)
 
                 # Assuming batch_policy_labels are MCTS visit counts/probabilities (distributions).
-                if train.IS_MCTS:
-                    log_policy_probs = F.log_softmax(policy_logits, dim=1)
-                    lp = kld_loss(log_policy_probs, batch_policy_labels)
-                else:
-                    lp = ce(policy_logits, policy_target_indices)
+
+                lp = ce(policy_logits, batch_policy_labels)
 
 
                 # Ensure batch_value_labels has the same shape as value_pred ([batch_size])

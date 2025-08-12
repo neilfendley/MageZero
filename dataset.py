@@ -10,62 +10,65 @@ import sys
 
 class LabeledStateDataset(Dataset):
     """
-    Loads labeled state data from a single binary file.
-    This class remains unchanged and still operates on a single file path.
+    CORRECTED: Handles lazy loading correctly for multiprocessing.
+    It opens the file handle *inside* each worker process to avoid pickling errors.
     """
 
     def __init__(self, path):
-        self.samples = []
-        self.S = 0  # Global vocabulary size (total number of possible features)
-        self.A = 0  # Action dimension
+        self.path = path
+        self.offsets = []
+        self.n = 0
+        self.A = 0
+        self.S = 0
 
-        with open(path, "rb") as f:
-            # Read the 12-byte header
+        # --- PRE-CALCULATION STEP ---
+        # Open the file *temporarily* in the main process just to build the index of byte offsets.
+        # The 'with' statement ensures it's closed immediately after.
+        with open(self.path, "rb") as f:
             header = f.read(12)
             if len(header) < 12:
                 raise IOError(f"File too small for header: {path}")
+            self.n, self.S, self.A = struct.unpack(">iii", header)
 
-            # Unpack the 3 integers
-            n, self.S, self.A = struct.unpack(">iii", header)
+            current_offset = 12  # Start after the header
+            for _ in range(self.n):
+                self.offsets.append(current_offset)
+                (num_indices,) = struct.unpack(">i", f.read(4))
+                record_size = 4 + (num_indices * 4) + (self.A * 8) + 8
+                current_offset += record_size
+                f.seek(current_offset)
 
-            for i in range(n):
-                # 1) Read the number of active indices
-                num_indices_bytes = f.read(4)
-                if not num_indices_bytes: break  # Handles empty files or trailing data
-                (num_indices,) = struct.unpack(">i", num_indices_bytes)
-
-                # 2) Read the indices
-                indices_bytes = f.read(num_indices * 4)
-                if len(indices_bytes) < num_indices * 4:
-                    raise IOError(f"Unexpected EOF when reading indices at record {i} in {path}")
-                indices = struct.unpack(f">{num_indices}i", indices_bytes)
-
-                # 3) Read action-distribution
-                action_bytes = f.read(self.A * 8)
-                if len(action_bytes) < self.A * 8:
-                    raise IOError(f"Unexpected EOF when reading action-vector at record {i} in {path}")
-                actions = struct.unpack(f">{self.A}d", action_bytes)
-
-                # 4) Read result label
-                label_bytes = f.read(8)
-                if len(label_bytes) < 8:
-                    raise IOError(f"Unexpected EOF when reading label at record {i} in {path}")
-                (label,) = struct.unpack(">d", label_bytes)
-
-                # Store the processed sample
-                self.samples.append({
-                    "indices": torch.LongTensor(indices),
-                    "policy": torch.FloatTensor(actions),
-                    "value": torch.FloatTensor([label])
-                })
+        # IMPORTANT: self.file is NOT created here.
 
     def __len__(self):
-        return len(self.samples)
+        return self.n
 
     def __getitem__(self, idx):
-        # Return the pre-processed sample dictionary
-        sample = self.samples[idx]
-        return sample["indices"], sample["policy"], sample["value"]
+        # The first time a worker process calls __getitem__, it won't have the 'file' attribute.
+        # We create it here, so each worker gets its own file handle.
+        if not hasattr(self, 'file'):
+            self.file = open(self.path, "rb")
+
+        # Go to the pre-calculated position for this sample
+        offset = self.offsets[idx]
+        self.file.seek(offset)
+
+        # Read ONLY the data for this one sample
+        (num_indices,) = struct.unpack(">i", self.file.read(4))
+        indices = struct.unpack(f">{num_indices}i", self.file.read(num_indices * 4))
+        actions = struct.unpack(f">{self.A}d", self.file.read(self.A * 8))
+        (label,) = struct.unpack(">d", self.file.read(8))
+
+        return (
+            torch.LongTensor(indices),
+            torch.FloatTensor(actions),
+            torch.FloatTensor([label])
+        )
+
+    def __del__(self):
+        # When a worker process is destroyed, this will close its file handle
+        if hasattr(self, 'file'):
+            self.file.close()
 
 
 def collate_batch(batch):

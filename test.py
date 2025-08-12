@@ -11,7 +11,7 @@ from train import EPOCH_COUNT
 
 def validate():
 
-    test_ds = "data/UWTempo/ver3/testing/testing2.bin"
+    test_ds = "data/UWTempo/ver1/testing/testing1.bin"
     ds = LabeledStateDataset(test_ds)
     dl = DataLoader(ds, batch_size=128, shuffle=False, num_workers=4, collate_fn=collate_batch)
 
@@ -25,7 +25,7 @@ def validate():
 
 
     for i in range(1, train.EPOCH_COUNT+1):
-        checkpoint_path = f"models/model2/ckpt_{i}.pt"  # Make sure this is the correct checkpoint
+        checkpoint_path = f"models/model4/ckpt_{i}.pt"  # Make sure this is the correct checkpoint
         try:
             checkpoint = torch.load(checkpoint_path, map_location="cuda")
             model.load_state_dict(checkpoint['model_state_dict'])

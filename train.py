@@ -6,7 +6,7 @@ from dataset import LabeledStateDataset, collate_batch, load_dataset_from_direct
 from typing import Set, List, Tuple
 ACTIONS_MAX = 128
 GLOBAL_MAX = 100000
-EPOCH_COUNT = 10
+EPOCH_COUNT = 20
 
 
 class Net(nn.Module):
@@ -49,9 +49,9 @@ class Net(nn.Module):
 
 def train():
 
-    combined_ds = load_dataset_from_directory("data/UWTempo/ver3/training")
+    combined_ds = load_dataset_from_directory("data/UWTempo/ver4/training")
     #combined_ds = LabeledStateDataset("data/UWTempo/ver3/training/training.bin")
-    dl = DataLoader(combined_ds, batch_size=128, shuffle=True, num_workers=4, collate_fn=collate_batch)
+    dl = DataLoader(combined_ds, batch_size=128, shuffle=True, num_workers=16, collate_fn=collate_batch, pin_memory=True, persistent_workers=True)
     model = Net(GLOBAL_MAX, ACTIONS_MAX).cuda()
 
 
@@ -123,7 +123,7 @@ def train():
 
         # It's good practice to save checkpoints less frequently, e.g., every 5-10 epochs
         # or based on validation performance, but for now, this is fine.
-        checkpoint_save_path = f"models/model3/ckpt_{epoch}.pt"  # Use a consistent path
+        checkpoint_save_path = f"models/model4/ckpt_{epoch}.pt"  # Use a consistent path
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),

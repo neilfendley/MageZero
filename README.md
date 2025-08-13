@@ -8,10 +8,6 @@ MageZero is not a reinforcement learning (RL) agent in itself. It is a framework
 
 This approach reframes the challenge of MTG AI from universal mastery to local optimization. By training agents within constrained, well-defined deck environments, MageZero can develop competitive playstyles and meaningful policy/value representations without requiring LLM-scale resources.
 
-MageZero is built to exploit biases of MTG that are often overlooked. These biases are:
-* **Combinatorial Nature**: MTG decks are built around overlapping combinations of synergistic cards. In every deck, every card has a purpose, and that purpose largely remains the same across different opponents and **game states**.
-* **Deck-specific Structure**: While **as a whole** MTG is as abstract as a language, within the context of one deck, MTG can be more structured than chess. The challenge is identifying and exploiting this structure, as it is not explicitly defined. MageZero leans toward lighter, less generalizable models, with more dynamic feature extraction.
-
 ---
 
 ### 2. Current Status: **Alpha (Actively in Development)**

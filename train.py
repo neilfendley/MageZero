@@ -2,11 +2,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn, optim
 from torch.utils.data import ConcatDataset, DataLoader, Subset
-from dataset import LabeledStateDataset, collate_batch, load_dataset_from_directory
+from dataset import LabeledStateDataset, collate_batch, load_dataset_from_directory, create_redundancy_ignore_list, \
+    remove_one_hot_labels
 from typing import Set, List, Tuple
+from pyroaring import BitMap
 ACTIONS_MAX = 128
 GLOBAL_MAX = 100000
-EPOCH_COUNT = 20
+EPOCH_COUNT = 60
+VER_NUMBER = 14
 
 
 class Net(nn.Module):
@@ -25,7 +28,7 @@ class Net(nn.Module):
         # 1. Define the learnable bias parameter
         self.embedding_bias = nn.Parameter(torch.zeros(embedding_dim))
         self.embedding_norm = nn.LayerNorm(embedding_dim)
-        self.embedding_dropout = nn.Dropout(p=0.3)
+        self.embedding_dropout = nn.Dropout(p=0.2)
 
         self.fc_after_embedding = nn.Sequential(
             nn.Linear(embedding_dim, hidden_dim_mlp),  # From 512 to 256
@@ -49,10 +52,21 @@ class Net(nn.Module):
 
 def train():
 
-    combined_ds = load_dataset_from_directory("data/UWTempo/ver8/training")
+    combined_ds = load_dataset_from_directory(f"data/UWTempo/ver{VER_NUMBER}/training")
     #combined_ds = LabeledStateDataset("data/UWTempo/ver3/training/training.bin")
-    dl = DataLoader(combined_ds, batch_size=128, shuffle=True, num_workers=16, collate_fn=collate_batch, pin_memory=True, persistent_workers=True)
+    print("Generating ignore list for combined dataset. to use for model")
+    ignore_list = create_redundancy_ignore_list(combined_ds, GLOBAL_MAX)
+    for ds in combined_ds.datasets:
+        ds.ignore_list = ignore_list
+    print("Saving ignore list to ignore.roar")
+    ignore = BitMap(ignore_list)  # iterable of ints
+    with open("ignore.roar", "wb") as f:
+        f.write(ignore.serialize())
+    #print("Removing all one hot labels")
+    #combined_ds = remove_one_hot_labels(combined_ds)
     model = Net(GLOBAL_MAX, ACTIONS_MAX).cuda()
+    dl = DataLoader(combined_ds, batch_size=128, shuffle=True, num_workers=16, collate_fn=collate_batch,
+                    pin_memory=True, persistent_workers=True)
 
 
     sparse_params = model.embedding_bag.parameters()
@@ -83,12 +97,13 @@ def train():
     except Exception as e:
         print(f"ERROR: Could not load checkpoint. {e}. Starting from scratch.")
 
-    ce = nn.CrossEntropyLoss()
     mse = nn.MSELoss()
+    kld = nn.KLDivLoss(reduction='batchmean')
 
 
     for epoch in range(1, EPOCH_COUNT+1):
         total_p_loss, total_v_loss = 0.0, 0.0  # Initialize as floats
+        total_p_examples = 0
         model.train()
 
         # 4. Update the loop to unpack all parts returned by collate_batch
@@ -102,8 +117,22 @@ def train():
             # 6. Model call uses indices and offsets
             policy_logits, value_pred = model(batch_indices, batch_offsets)
 
-            policy_target_indices = torch.argmax(batch_policy_labels, dim=1)
-            lp = ce(policy_logits, batch_policy_labels)
+            nonzero = (batch_policy_labels > 0.0001).sum(dim=1)  # [B]
+            decision_mask = nonzero > 1  # [B] bool
+
+            if decision_mask.any():
+                logits_d = policy_logits[decision_mask]  # [B_dec, A]
+                targets_d = batch_policy_labels[decision_mask]  # [B_dec, A]
+                log_probs_d = F.log_softmax(logits_d, dim=1)
+                lp = kld(log_probs_d, targets_d)
+                b_dec = logits_d.size(0)
+                total_p_loss += lp.item() * b_dec
+                total_p_examples += b_dec
+            else:
+                lp = torch.zeros((), device=value_pred.device)
+
+            #log_probs = F.log_softmax(policy_logits, dim=1)
+            #lp = kld(log_probs, batch_policy_labels)
 
             lv = mse(value_pred, batch_value_labels.squeeze(-1))  # Ensure batch_value_labels is shape [batch_size]
             loss = lp + lv
@@ -114,16 +143,14 @@ def train():
             opt_sparse.step()
             opt_dense.step()
 
-            total_p_loss += lp.item()
             total_v_loss += lv.item()
 
-        avg_p_loss = total_p_loss / len(dl)
+        avg_p_loss = (total_p_loss / max(total_p_examples, 1))
         avg_v_loss = total_v_loss / len(dl)
-        print(f"Epoch {epoch}  policy_loss={avg_p_loss:.3f}  value_loss={avg_v_loss:.3f}")
-
+        print(f"Epoch {epoch}  policy_loss={avg_p_loss:.3f}  value_loss={avg_v_loss:.3f}  decision_states={total_p_examples}")
         # It's good practice to save checkpoints less frequently, e.g., every 5-10 epochs
         # or based on validation performance, but for now, this is fine.
-        checkpoint_save_path = f"models/model8/ckpt_{epoch}.pt"  # Use a consistent path
+        checkpoint_save_path = f"models/model{VER_NUMBER}/ckpt_{epoch}.pt"  # Use a consistent path
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -133,7 +160,6 @@ def train():
             'avg_v_loss': avg_v_loss,  # Optional: save last loss
         }, checkpoint_save_path)
         #torch.save(model.state_dict(), f"weights/ckpt_{epoch}.pt")
-
 
 if __name__ == "__main__":
     train()

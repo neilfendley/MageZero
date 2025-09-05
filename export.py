@@ -16,7 +16,7 @@ output_path = os.path.join(output_dir, "Model.onnx")
 model = train.Net(train.GLOBAL_MAX, train.ACTIONS_MAX)
 
 # Load the desired checkpoint
-checkpoint_path = f"models/model{VER_NUMBER}/ckpt_54.pt" #was 7
+checkpoint_path = f"models/model{VER_NUMBER}/ckpt_52.pt" #was 7
 try:
     checkpoint = torch.load(checkpoint_path, map_location="cuda")
     model.load_state_dict(checkpoint['model_state_dict'])

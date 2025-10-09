@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 # =========================
 # CONFIG (edit these)
 # =========================
-DATA_DIR = "data/UWTempo/ver15/training"  # <-- your folder of .bin files
+DATA_DIR = "data/MTGA_MonoU/ver2/training"  # <-- your folder of .bin files
 OUT_DIR = "stats_out"                     # where to save figures
 SHOW_PLOTS = True                         # False if running headless
 SAVE_PLOTS = True                         # save images to OUT_DIR
@@ -225,7 +225,7 @@ def main():
 
     # 1) Load and combine datasets
     full_dataset = load_dataset_from_directory(DATA_DIR)
-    full_dataset = remove_one_hot_labels(full_dataset)
+    #full_dataset = remove_one_hot_labels(full_dataset)
     total_samples = len(full_dataset)
     print(f"\n=== Loaded dataset ===")
     print(f"Path: {DATA_DIR}")
@@ -236,6 +236,7 @@ def main():
     print(f"Unique active feature indices (present in data): {uniq_count}")
 
     # 3) Redundancy analysis
+
     print("\n=== Redundancy analysis ===")
     ra = redundancy_analysis(full_dataset, num_global)
     print(f"Samples scanned: {ra['num_samples']}")
@@ -245,7 +246,7 @@ def main():
     print(f"Redundant present features (to drop): {ra['num_redundant_present']}")
     print(f"Non-redundant features among PRESENT: {ra['num_nonredundant_present']}")
     print(f"Non-redundant features GLOBAL (kept after dropping unseen & dups): {ra['kept_global']}")
-
+    
     if APPLY_IGNORE:
         set_ignore_list(full_dataset, ra["ignore_set"])
         print("Applied ignore set to dataset (unseen + redundant).")

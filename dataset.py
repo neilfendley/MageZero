@@ -12,8 +12,6 @@ import os
 
 from scipy.sparse import coo_matrix
 
-MAX_FEATURES = 100000
-
 class LabeledStateDataset(Dataset):
     """
     CORRECTED: Handles lazy loading correctly for multiprocessing.
@@ -215,7 +213,7 @@ def create_redundancy_ignore_list(dataset, num_global_features: int) -> Set[int]
     ignore = set()
 
     unseen = groups.get((), [])
-    ignore.update(unseen)
+    #ignore.update(unseen)
 
     for key, js in groups.items():
         if key == () or len(js) == 1:
@@ -228,6 +226,7 @@ def create_redundancy_ignore_list(dataset, num_global_features: int) -> Set[int]
     print(f"Analysis complete. Found {num_duplicate_sets} sets of redundant features.")
     print(f"A total of {len(ignore)} feature indices will be ignored.")
     print(f"{kept} feature indices were kept.")
+    print(f"{kept - len(unseen)} seen feature indices were kept.")
 
     return ignore
 
@@ -268,7 +267,7 @@ def remove_one_hot_labels(dataset, eps: float = 1e-8, verbose: bool = True):
 # --- Main execution block ---
 if __name__ == "__main__":
     # Define the directory where you save your game data files.
-    data_directory = "data/UWTempo/ver7/training"
+    data_directory = "data/MTGA_MonoU/ver1/training"
 
     try:
         # Load all datasets from the specified folder

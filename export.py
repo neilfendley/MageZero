@@ -1,13 +1,13 @@
 import torch
 import os
 import train
-from train import VER_NUMBER
+from train import VER_NUMBER,DECK_NAME
 
 # These constants must match the parameters used to train the model you are exporting.
 # The GLOBAL_MAX defines the size of the embedding layer's weight matrix.
 
 # Define the output path and ensure the directory exists
-output_dir = f"exports/UWTempo/ver{VER_NUMBER}" # Example directory
+output_dir = f"exports/{DECK_NAME}/ver{VER_NUMBER}" # Example directory
 os.makedirs(output_dir, exist_ok=True)
 output_path = os.path.join(output_dir, "Model.onnx")
 
@@ -15,8 +15,11 @@ output_path = os.path.join(output_dir, "Model.onnx")
 # Instantiate the model with the correct (large) vocabulary size
 model = train.Net(train.GLOBAL_MAX, train.ACTIONS_MAX)
 
+with torch.no_grad():
+    model.embedding_bag.weight.data = model.embedding_bag.weight.data.half()
+
 # Load the desired checkpoint
-checkpoint_path = f"models/model{VER_NUMBER}/ckpt_52.pt" #was 7
+checkpoint_path = f"models/model{VER_NUMBER}/ckpt_80.pt" #was 7
 try:
     checkpoint = torch.load(checkpoint_path, map_location="cuda")
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -35,6 +38,7 @@ model.eval()
 #    The indices must be LongTensors (int64).
 dummy_indices = torch.LongTensor([10, 20, 150, 4000]) # Example active feature indices
 dummy_offsets = torch.LongTensor([0])                # For a batch of 1, the offset starts at index 0
+
 
 print("\n--- Running pre-export inference test in PyTorch ---")
 with torch.no_grad(): # Disable gradient calculation for inference
@@ -61,6 +65,7 @@ torch.onnx.export(
         "value":   {0: "batch_size"}         # The batch size is variable
     },
     opset_version=13, # Using a reasonably modern opset is good practice
+    external_data=False,
     do_constant_folding=True
 )
 

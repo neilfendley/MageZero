@@ -2,14 +2,19 @@ import torch
 import torch.nn.functional as F
 from torch import nn, optim
 from torch.utils.data import ConcatDataset, DataLoader, Subset
+import os
+
 from dataset import LabeledStateDataset, collate_batch, load_dataset_from_directory, create_redundancy_ignore_list, \
     remove_one_hot_labels
 from typing import Set, List, Tuple
 from pyroaring import BitMap
+
+
 ACTIONS_MAX = 128
-GLOBAL_MAX = 100000
-EPOCH_COUNT = 60
-VER_NUMBER = 14
+GLOBAL_MAX = 2000000
+EPOCH_COUNT = 80
+VER_NUMBER = 3
+DECK_NAME = "MTGA_MonoU"
 
 
 class Net(nn.Module):
@@ -49,10 +54,14 @@ class Net(nn.Module):
         return self.policy_head(h), self.value_head(h).squeeze(-1)
 
 
+def normalize_policy_labels(raw: torch.Tensor) -> torch.Tensor:
+    denom = raw.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    return raw / denom
+
 
 def train():
-
-    combined_ds = load_dataset_from_directory(f"data/UWTempo/ver{VER_NUMBER}/training")
+    os.makedirs(f"models/{DECK_NAME}/ver{VER_NUMBER}", exist_ok=True)
+    combined_ds = load_dataset_from_directory(f"data/{DECK_NAME}/ver{VER_NUMBER}/training")
     #combined_ds = LabeledStateDataset("data/UWTempo/ver3/training/training.bin")
     print("Generating ignore list for combined dataset. to use for model")
     ignore_list = create_redundancy_ignore_list(combined_ds, GLOBAL_MAX)
@@ -60,12 +69,10 @@ def train():
         ds.ignore_list = ignore_list
     print("Saving ignore list to ignore.roar")
     ignore = BitMap(ignore_list)  # iterable of ints
-    with open("ignore.roar", "wb") as f:
+    with open(f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar", "wb") as f:
         f.write(ignore.serialize())
-    #print("Removing all one hot labels")
-    #combined_ds = remove_one_hot_labels(combined_ds)
     model = Net(GLOBAL_MAX, ACTIONS_MAX).cuda()
-    dl = DataLoader(combined_ds, batch_size=128, shuffle=True, num_workers=16, collate_fn=collate_batch,
+    dl = DataLoader(combined_ds, batch_size=128, shuffle=True, num_workers=8, collate_fn=collate_batch,
                     pin_memory=True, persistent_workers=True)
 
 
@@ -79,7 +86,7 @@ def train():
             dense_params.append(param)
     opt_dense = optim.Adam(dense_params, lr=5e-4)
 
-    checkpoint_path = f"models/model0/ckpt_11.pt"  # Example: Starting from ckpt_16
+    checkpoint_path = f"models/model0/ckpt_0.pt"  # Example: Starting from ckpt_16
 
     try:
         checkpoint = torch.load(checkpoint_path, map_location="cuda")
@@ -88,9 +95,7 @@ def train():
         opt_dense.load_state_dict(checkpoint['optimizer_dense_state_dict'])
         # start_epoch = checkpoint['epoch'] + 1 # Use this if you want to continue the same run
         print(f"Successfully loaded checkpoint from {checkpoint_path}")
-        # If continuing a run, you might load the epoch and loss too:
-        # last_epoch = checkpoint['epoch']
-        # print(f"Resuming training from epoch {last_epoch + 1}")
+
 
     except FileNotFoundError:
         print(f"INFO: Checkpoint file not found at {checkpoint_path}. Starting from scratch.")
@@ -113,6 +118,9 @@ def train():
             batch_offsets = batch_offsets.cuda()
             batch_policy_labels = batch_policy_labels.cuda()
             batch_value_labels = batch_value_labels.cuda()
+
+            # normalize
+            batch_policy_labels = normalize_policy_labels(batch_policy_labels)
 
             # 6. Model call uses indices and offsets
             policy_logits, value_pred = model(batch_indices, batch_offsets)
@@ -150,16 +158,18 @@ def train():
         print(f"Epoch {epoch}  policy_loss={avg_p_loss:.3f}  value_loss={avg_v_loss:.3f}  decision_states={total_p_examples}")
         # It's good practice to save checkpoints less frequently, e.g., every 5-10 epochs
         # or based on validation performance, but for now, this is fine.
-        checkpoint_save_path = f"models/model{VER_NUMBER}/ckpt_{epoch}.pt"  # Use a consistent path
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_sparse_state_dict': opt_sparse.state_dict(),
-            'optimizer_dense_state_dict': opt_dense.state_dict(),
-            'avg_p_loss': avg_p_loss,  # Optional: save last loss
-            'avg_v_loss': avg_v_loss,  # Optional: save last loss
-        }, checkpoint_save_path)
-        #torch.save(model.state_dict(), f"weights/ckpt_{epoch}.pt")
+        if epoch == EPOCH_COUNT:
+            checkpoint_save_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt"  # Use a consistent path
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_sparse_state_dict': opt_sparse.state_dict(),
+                'optimizer_dense_state_dict': opt_dense.state_dict(),
+                'avg_p_loss': avg_p_loss,  # Optional: save last loss
+                'avg_v_loss': avg_v_loss,  # Optional: save last loss
+            }, checkpoint_save_path)
+
+            #torch.save(model.state_dict(), f"weights/ckpt_{epoch}.pt")
 
 if __name__ == "__main__":
     train()

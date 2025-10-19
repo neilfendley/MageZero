@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader, ConcatDataset
 # =========================
 # CONFIG (edit these)
 # =========================
-DATA_DIR = "data/MTGA_MonoU/ver2/training"  # <-- your folder of .bin files
+DATA_DIR = "data/MTGA_MonoU/ver6/training"  # <-- your folder of .bin files
 OUT_DIR = "stats_out"                     # where to save figures
 SHOW_PLOTS = True                         # False if running headless
 SAVE_PLOTS = True                         # save images to OUT_DIR
@@ -45,8 +45,8 @@ from dataset import (
     LabeledStateDataset,
     load_dataset_from_directory,
     collate_batch,
-    MAX_FEATURES, remove_one_hot_labels,
 )
+MAX_FEATURES = 2000000
 
 # ---------- Helpers (pure Python; do not modify dataset.py) ----------
 

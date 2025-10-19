@@ -6,43 +6,18 @@ from torch.utils.data import DataLoader
 
 # If Net is also in dataset.py or a separate model.py, adjust import accordingly.
 import train  # Or from train import Net, ACTIONS_MAX (if ACTIONS_MAX is defined there)
-from dataset import LabeledStateDataset, collate_batch, load_dataset_from_directory, \
+from dataset import AvroIndexed, collate_batch, load_dataset_from_directory, \
     create_redundancy_ignore_list, remove_one_hot_labels  # CRITICAL: Import collate_batch
-from train import EPOCH_COUNT, VER_NUMBER, DECK_NAME
+#from train import Net, ACTIONS_MAX, EPOCH_COUNT, VER_NUMBER, DECK_NAME
 
 SHOW_CONFUSION_MATRIX = True
-def validate():
 
-    combined_ds = load_dataset_from_directory(f"data/{DECK_NAME}/ver{VER_NUMBER}/testing")
-    with open(f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar", "rb") as f:
-        ignore = BitMap.deserialize(f.read())
-    print(len(ignore))
-    for ds in combined_ds.datasets:
-         ds.ignore_list = ignore
+mse = nn.MSELoss()
+kld = nn.KLDivLoss(reduction='batchmean')
 
-    dl = DataLoader(combined_ds, batch_size=128, shuffle=False, num_workers=16, collate_fn=collate_batch, pin_memory=True, persistent_workers=True)
-
-    # 3. Model instantiation uses global vocab size (ds.S) and action size
-    model = train.Net(train.GLOBAL_MAX, train.ACTIONS_MAX).cuda()  # should be GLOBAL_VOCAB_SIZE
-
-    model.eval()  # Set model to evaluation mode
-
-    mse = nn.MSELoss()
-    kld = nn.KLDivLoss(reduction='batchmean')
-
-
-    checkpoint_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt"  # Make sure this is the correct checkpoint
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location="cuda")
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"Loaded checkpoint from {checkpoint_path}")
-    except FileNotFoundError:
-        print(f"ERROR: Checkpoint file not found at {checkpoint_path}. Testing with an uninitialized model.")
-        return
-    except Exception as e:
-        print(f"ERROR: Could not load checkpoint. {e}. Testing with an uninitialized model.")
-        return
+def validate(model, dl):
     # Metrics accumulators
+    model.eval()
     correct_policy_preds, total_policy_samples = 0, 0
     total_policy_loss, total_value_loss, total_combined_loss = 0.0, 0.0, 0.0
     confusion_matrix = torch.zeros(train.ACTIONS_MAX, train.ACTIONS_MAX, dtype=torch.long)
@@ -78,7 +53,7 @@ def validate():
                 predicted_actions_d = torch.argmax(policy_logits[decision_mask], dim=1)
                 # policy_target_indices are already the true action indices
                 correct_policy_preds += (predicted_actions_d == policy_target_indices_d).sum().item()
-                # NEW: Populate the confusion matrix
+                # Populate the confusion matrix
                 for true_action, pred_action in zip(policy_target_indices_d.cpu(), predicted_actions_d.cpu()):
                     confusion_matrix[true_action, pred_action] += 1
             else:
@@ -92,12 +67,12 @@ def validate():
 
 
     avg_policy_loss = total_policy_loss / max(1,total_policy_samples)
-    avg_value_loss = total_value_loss / len(combined_ds)  # Denominator should be total_policy_samples or len(ds)
+    avg_value_loss = total_value_loss / len(dl.dataset)  # Denominator should be total_policy_samples or len(ds)
     avg_combined_loss = total_combined_loss / len(dl)
     print(f"Test policy_loss={avg_policy_loss:.3f}  value_loss={avg_value_loss:.3f}  decision_states={total_policy_samples}  combined_loss={avg_combined_loss:.3f}")
     if total_policy_samples > 0:
         print(f"Test policy_accuracy={correct_policy_preds / total_policy_samples:.3f}")
-        # NEW: Print the actual confusion matrix for the first 32 actions
+        # Print the actual confusion matrix for the first 32 actions
         if SHOW_CONFUSION_MATRIX:
             print("--- Policy Confusion Matrix (True \\ Predicted) ---")
             matrix_size = 32
@@ -120,4 +95,29 @@ def validate():
             print("No samples in test set to calculate accuracy.")
 
 if __name__ == "__main__":
-    validate()
+    combined_ds = load_dataset_from_directory(f"data/{train.DECK_NAME}/ver{train.VER_NUMBER}/testing")
+    with open(f"models/{train.DECK_NAME}/ver{train.VER_NUMBER}/ignore.roar", "rb") as f:
+        ignore = BitMap.deserialize(f.read())
+    print(len(ignore))
+    for ds in combined_ds.datasets:
+        ds.ignore_list = ignore
+
+    dl = DataLoader(combined_ds, batch_size=128, shuffle=False, num_workers=16, collate_fn=collate_batch,
+                    pin_memory=True, persistent_workers=True)
+
+    # 3. Model instantiation uses global vocab size (ds.S) and action size
+    model = train.Net(train.GLOBAL_MAX, train.ACTIONS_MAX).cuda()  # should be GLOBAL_VOCAB_SIZE
+
+    model.eval()  # Set model to evaluation mode
+
+
+    checkpoint_path = f"models/{train.DECK_NAME}/ver{train.VER_NUMBER}/model.pt"  # Make sure this is the correct checkpoint
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cuda")
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded checkpoint from {checkpoint_path}")
+    except FileNotFoundError:
+        print(f"ERROR: Checkpoint file not found at {checkpoint_path}. Testing with an uninitialized model.")
+    except Exception as e:
+        print(f"ERROR: Could not load checkpoint. {e}. Testing with an uninitialized model.")
+    validate(model, dl)

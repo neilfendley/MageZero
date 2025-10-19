@@ -95,10 +95,19 @@ def worker_loop():
             batch[0].t_done = time.perf_counter()
             batch[0].evt.set()
         else:
-            # Concatenate batch along the bag dimension
-            idx = torch.cat([p.idx for p in batch], dim=0)
-            # Offsets are per-sample starts; stack and rely on EmbeddingBag semantics of concatenation
-            off = torch.cat([p.off for p in batch], dim=0)
+            # Concatenate indices
+            idx_list = [p.idx for p in batch]
+            idx = torch.cat(idx_list, dim=0)
+
+            # One bag per request → offsets are cumulative sizes
+            sizes = [int(x.numel()) for x in idx_list]  # e.g., [len0, len1, ...]
+            offsets = [0]
+            running = 0
+            for s in sizes[:-1]:
+                running += s
+                offsets.append(running)
+            off = torch.tensor(offsets, dtype=torch.long, device=DEVICE)
+
             with torch.no_grad():
                 pol, val = model(idx, off)   # [B, A], [B]
             pol = pol.detach().to("cpu")

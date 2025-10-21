@@ -1,23 +1,45 @@
+from enum import Enum
+
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
-from torch.utils.data import ConcatDataset, DataLoader, Subset
+from torch.utils.data import DataLoader
 import os
 
 import test
-from dataset import AvroIndexed, collate_batch, load_dataset_from_directory, create_redundancy_ignore_list, \
-    remove_one_hot_labels
-from typing import Set, List, Tuple
+from dataset import H5Indexed, collate_batch,  create_redundancy_ignore_list
 from pyroaring import BitMap
 
 MAKE_IGNORE_LIST = True
 ACTIONS_MAX = 128
 GLOBAL_MAX = 2000000
-EPOCH_COUNT = 60
-VER_NUMBER = 6
+EPOCH_COUNT = 20
+VER_NUMBER = 8
 DECK_NAME = "MTGA_MonoU"
 
+#TODO: wire into xmage data pipeline
+#for now just manually enter your matchup-specific action spaces here for optimal normalization(in XMage run getActionsSpaces())
+PRIORITY_A_MAX = 30
+PRIORITY_B_MAX = 20
+TARGETS_MAX = 60
+BINARY_MAX = 2
 
+
+class ActionType(Enum):
+    PRIORITY = 0
+    CHOOSE_TARGET = 3
+    CHOOSE_USE = 5
+
+"""
+MageZero Neural Network architecture for AlphaZero style MCTS:
+2M sparse embedding bag -> 512D hidden layer -> 256D hidden layer -> (3 x 128D policy heads + 2D binary policy head + 1D value head)
+
+Policy heads are for each decision type (disjoint action spaces) they are:
+128D PriorityA (priority actions for PlayerA - which is this agent)
+128D PriorityB (priority actions for PlayerB - which is the opponent)
+128D Choose Target (target choices for both players)
+2D Choose Use (binary decisions for either player - this is used for selecting attackers and blockers)
+"""
 class Net(nn.Module):
     def __init__(self, num_embeddings, policy_size_A):
         super().__init__()
@@ -40,8 +62,12 @@ class Net(nn.Module):
             nn.Linear(embedding_dim, hidden_dim_mlp),  # From 512 to 256
             nn.ReLU(),
         )
+        #policy heads (all 256->128)
+        self.player_priority_head = nn.Linear(hidden_dim_mlp, policy_size_A)
+        self.opponent_priority_head = nn.Linear(hidden_dim_mlp, policy_size_A)
+        self.target_head = nn.Linear(hidden_dim_mlp, policy_size_A)
+        self.binary_head = nn.Linear(hidden_dim_mlp, 2)
 
-        self.policy_head = nn.Linear(hidden_dim_mlp, policy_size_A)  # From 256 to A
         self.value_head = nn.Sequential(
             nn.Linear(hidden_dim_mlp, 1),  # From 256 to 1
             nn.Tanh()
@@ -52,51 +78,47 @@ class Net(nn.Module):
         emb = self.embedding_dropout(emb)
         emb = self.embedding_norm(emb + self.embedding_bias)
         h = self.fc_after_embedding(emb)
-        return self.policy_head(h), self.value_head(h).squeeze(-1)
+        return self.player_priority_head(h), self.opponent_priority_head(h), self.target_head(h), self.binary_head(h), self.value_head(h).squeeze(-1)
 
 
 def normalize_policy_labels(raw: torch.Tensor) -> torch.Tensor:
-    denom = raw.sum(dim=1, keepdim=True).clamp(min=1e-8)
-    return raw / denom
+    total = raw.sum(dim=1, keepdim=True).clamp(min=1e-8)
+    return raw / total
 
 
 def train():
     os.makedirs(f"models/{DECK_NAME}/ver{VER_NUMBER}", exist_ok=True)
-    combined_ds = load_dataset_from_directory(f"data/{DECK_NAME}/ver{VER_NUMBER}/training")
+    ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training")
     #combined_ds = AvroIndexed("data/UWTempo/ver3/training/training.bin")
     print("Generating ignore list for combined dataset. to use for model")
-    ignore_list = create_redundancy_ignore_list(combined_ds, GLOBAL_MAX)
+    ignore_list = create_redundancy_ignore_list(ds)
     if not MAKE_IGNORE_LIST: ignore_list = []
-    for ds in combined_ds.datasets:
-        ds.ignore_list = ignore_list
+    ds.ignore_list = ignore_list
     print("Saving ignore list to ignore.roar")
     ignore = BitMap(ignore_list)  # iterable of ints
     print(len(ignore))
     with open(f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar", "wb") as f:
         f.write(ignore.serialize())
     model = Net(GLOBAL_MAX, ACTIONS_MAX).cuda()
-    dl = DataLoader(combined_ds, batch_size=128, shuffle=True, num_workers=8, collate_fn=collate_batch,
-                    pin_memory=True, persistent_workers=True)
-    #make validation dl
-    combined_ds_test = load_dataset_from_directory(f"data/{DECK_NAME}/ver{VER_NUMBER}/testing")
-    for ds in combined_ds_test.datasets:
-        ds.ignore_list = ignore
+    dl = DataLoader(ds, batch_size=128, shuffle=True, num_workers=0, collate_fn=collate_batch,
+                    pin_memory=True, persistent_workers=False)
+    #make validation dl (can be empty)
+    test_ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/testing")
+    dl_test = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=0, collate_fn=collate_batch,
+                    pin_memory=True, persistent_workers=False)
 
-    dl_test = DataLoader(combined_ds_test, batch_size=128, shuffle=False, num_workers=16, collate_fn=collate_batch,
-                    pin_memory=True, persistent_workers=True)
     test.SHOW_CONFUSION_MATRIX = False
-    #define optimizers
+
     sparse_params = model.embedding_bag.parameters()
     opt_sparse = optim.SparseAdam(sparse_params, lr=5e-4)#optim.SparseAdam(sparse_params, lr=1e-3)
 
-    # Optimizer for all other (dense) parameters
     dense_params = []
     for name, param in model.named_parameters():
         if "embedding_bag" not in name:  # Exclude embedding_bag parameters
             dense_params.append(param)
     opt_dense = optim.Adam(dense_params, lr=5e-4)
 
-    checkpoint_path = f"models/model0/ckpt_0.pt"  # Example: Starting from ckpt_16
+    checkpoint_path = f"models/model0/ckpt_0.pt"  #optional start point
 
     try:
         checkpoint = torch.load(checkpoint_path, map_location="cuda")
@@ -117,40 +139,80 @@ def train():
 
 
     for epoch in range(1, EPOCH_COUNT+1):
-        total_p_loss, total_v_loss = 0.0, 0.0  # Initialize as floats
-        total_p_examples = 0
+        total_pA_loss, total_pB_loss, total_t_loss, total_b_loss, total_v_loss = 0.0, 0.0, 0.0, 0.0, 0.0  # Initialize as floats
+        total_decision_examples, total_pA_examples, total_pB_examples, total_t_examples, total_b_examples = 0,0,0,0,0
         model.train()
 
-        # 4. Update the loop to unpack all parts returned by collate_batch
-        for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels in dl:
-            # 5. Move new input tensors to CUDA
+        for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in dl:
+            # Move new input tensors to CUDA
             batch_indices = batch_indices.cuda()
             batch_offsets = batch_offsets.cuda()
             batch_policy_labels = batch_policy_labels.cuda()
             batch_value_labels = batch_value_labels.cuda()
+            is_players = is_players.cuda().squeeze(-1).to(torch.bool)
+            action_types = action_types.cuda().squeeze(-1).to(torch.long)
 
-            # normalize
-            batch_policy_labels = normalize_policy_labels(batch_policy_labels)
+            # Model call uses indices and offsets
+            priority_logits, opponent_priority_logits, target_logits, binary_logits ,value_pred = model(batch_indices, batch_offsets)
 
-            # 6. Model call uses indices and offsets
-            policy_logits, value_pred = model(batch_indices, batch_offsets)
 
-            nonzero = (batch_policy_labels > 0.0001).sum(dim=1)  # [B]
-            decision_mask = nonzero > 1  # [B] bool
 
-            if decision_mask.any():
-                logits_d = policy_logits[decision_mask]  # [B_dec, A]
-                targets_d = batch_policy_labels[decision_mask]  # [B_dec, A]
-                log_probs_d = F.log_softmax(logits_d, dim=1)
-                lp = kld(log_probs_d, targets_d)
-                b_dec = logits_d.size(0)
-                total_p_loss += lp.item() * b_dec
-                total_p_examples += b_dec
+            nonzero = (batch_policy_labels > 0).sum(dim=1)  # [B]
+            decision_mask = nonzero > 1  # [B] states where more than one action is available
+            priority_mask = (action_types==ActionType.PRIORITY.value) & is_players & decision_mask
+            opponent_priority_mask = (action_types==ActionType.PRIORITY.value) & (~is_players) & decision_mask
+            target_mask = (action_types==ActionType.CHOOSE_TARGET.value) & decision_mask
+            binary_mask = (action_types==ActionType.CHOOSE_USE.value) & decision_mask
+
+            total_decision_examples += decision_mask.sum().item()
+
+            #priority A
+            if priority_mask.any():
+                log_probs_d = F.log_softmax(priority_logits[priority_mask][:,:PRIORITY_A_MAX], dim=1)
+                tgt = normalize_policy_labels(batch_policy_labels[priority_mask][:,:PRIORITY_A_MAX])
+                lpA = kld(log_probs_d, tgt)
+                s = log_probs_d.size(0)
+                total_pA_loss += lpA.item() * s
+                total_pA_examples += s
             else:
-                lp = torch.zeros((), device=value_pred.device)
+                lpA = torch.zeros((), device=value_pred.device)
 
-            lv = mse(value_pred, batch_value_labels.squeeze(-1))  # Ensure batch_value_labels is shape [batch_size]
-            loss = lp + lv
+            #priority B (this uses virtual visits)
+            if opponent_priority_mask.any():
+                log_probs_d = F.log_softmax(opponent_priority_logits[opponent_priority_mask][:,:PRIORITY_B_MAX], dim=1)
+                tgt = normalize_policy_labels(batch_policy_labels[opponent_priority_mask][:,:PRIORITY_B_MAX])
+                lpB = kld(log_probs_d, tgt)
+                s = log_probs_d.size(0)
+                total_pB_loss += lpB.item() * s
+                total_pB_examples += s
+            else:
+                lpB = torch.zeros((), device=value_pred.device)
+
+            #targets (shared between both players)
+            if target_mask.any():
+                log_probs_d = F.log_softmax(target_logits[target_mask][:,:TARGETS_MAX], dim=1)
+                tgt = normalize_policy_labels(batch_policy_labels[target_mask][:,:TARGETS_MAX])
+                lt = kld(log_probs_d, tgt)
+                s = log_probs_d.size(0)
+                total_t_loss += lt.item() * s
+                total_t_examples += s
+            else:
+                lt = torch.zeros((), device=value_pred.device)
+
+            # binary (choose to use) decisions
+            if binary_mask.any():
+                log_probs_d = F.log_softmax(binary_logits[binary_mask][:,:BINARY_MAX], dim=1)
+                tgt = normalize_policy_labels(batch_policy_labels[binary_mask][:,:BINARY_MAX])
+                lb = kld(log_probs_d, tgt)
+                s = log_probs_d.size(0)
+                total_b_loss += lb.item() * s
+                total_b_examples += s
+            else:
+                lb = torch.zeros((), device=value_pred.device)
+
+            lv = mse(value_pred, batch_value_labels.squeeze(-1))
+
+            loss = lpA + lpB + lt + lb + lv
 
             opt_sparse.zero_grad()
             opt_dense.zero_grad()
@@ -160,13 +222,16 @@ def train():
 
             total_v_loss += lv.item()
 
-        avg_p_loss = (total_p_loss / max(total_p_examples, 1))
+        avg_pA_loss = (total_pA_loss / max(total_pA_examples, 1))
+        avg_pB_loss = (total_pB_loss / max(total_pB_examples, 1))
+        avg_t_loss = (total_t_loss / max(total_t_examples, 1))
+        avg_b_loss = (total_b_loss / max(total_b_examples, 1))
         avg_v_loss = total_v_loss / len(dl)
-        print(f"Epoch {epoch}  policy_loss={avg_p_loss:.3f}  value_loss={avg_v_loss:.3f}  decision_states={total_p_examples}")
-        #run current model on testing set
-        test.validate(model, dl_test)
-        # It's good practice to save checkpoints less frequently, e.g., every 5-10 epochs
-        # or based on validation performance, but for now, this is fine.
+        print(f"Epoch {epoch}  priority_A_loss={avg_pA_loss:.3f}  priority_B_loss={avg_pB_loss:.3f} choose_target_loss={avg_t_loss:.3f} choose_use_loss={avg_b_loss:.3f} value_loss={avg_v_loss:.3f} decision_states={total_decision_examples}")
+        #run current model on testing set (if there is one)
+        if len(test_ds)>0:
+            test.validate(model, dl_test)
+        #TODO: make validation based checkpoint schedule
         if epoch == EPOCH_COUNT:
             checkpoint_save_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt"  # Use a consistent path
             torch.save({
@@ -174,11 +239,9 @@ def train():
                 'model_state_dict': model.state_dict(),
                 'optimizer_sparse_state_dict': opt_sparse.state_dict(),
                 'optimizer_dense_state_dict': opt_dense.state_dict(),
-                'avg_p_loss': avg_p_loss,  # Optional: save last loss
+                'avg_p_loss': avg_pA_loss,  # Optional: save last loss
                 'avg_v_loss': avg_v_loss,  # Optional: save last loss
             }, checkpoint_save_path)
-
-            #torch.save(model.state_dict(), f"weights/ckpt_{epoch}.pt")
 
 if __name__ == "__main__":
     train()

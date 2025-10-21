@@ -1,288 +1,247 @@
-"""
-mz_dataset_stats_simple.py
-
-Simple, hardcoded script to inspect MageZero .bin datasets using dataset.py.
-- No command line args.
-- Edit the CONFIG section and run.
-
-It prints:
-- total samples
-- unique active feature count
-- redundancy stats (unseen, duplicate groups, non-redundant present, kept global)
-- shows/saves: value label histogram ([-1,1]), average policy bar chart (first K actions)
-- preview of the first N samples
-"""
+# mz_dataset_stats_simple.py
 
 import os
-import sys
-from typing import Set, Dict, Any, List
+from typing import Iterable
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader
 
-# =========================
-# CONFIG (edit these)
-# =========================
-DATA_DIR = "data/MTGA_MonoU/ver6/training"  # <-- your folder of .bin files
-OUT_DIR = "stats_out"                     # where to save figures
-SHOW_PLOTS = True                         # False if running headless
-SAVE_PLOTS = True                         # save images to OUT_DIR
-POLICY_TOP_K = 50                         # first K actions in bar chart
-HIST_BINS = 21                            # histogram bins for values
-APPLY_IGNORE = False                      # apply ignore set (unseen + redundant) before stats
-NUM_GLOBAL_FEATURES_OVERRIDE = None       # e.g. 100000; None uses dataset.MAX_FEATURES
-PREVIEW_N = 50                            # how many samples to preview
+from dataset import H5Indexed, collate_batch, create_redundancy_ignore_list
+from train import (
+    DECK_NAME, VER_NUMBER, GLOBAL_MAX,
+    ActionType,
+    PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX,
+)
 
-# If headless, choose a non-GUI backend before importing pyplot
+# --------------------
+# Config (edit here)
+# --------------------
+SPLIT = "training"          # "training" or "testing"
+OUT_DIR = "stats_out"       # where to save figures
+SHOW_PLOTS = True           # headless? set False
+SAVE_PLOTS = True           # save PNGs to OUT_DIR
+TOP_K = 50                  # show first K bars for each head
+HIST_BINS = 21              # value histogram bins
+APPLY_IGNORE = True         # apply ignore list while streaming stats
+PREVIEW_N = 30              # preview count
+
+# Choose a non-GUI backend if headless
 if not SHOW_PLOTS:
     import matplotlib
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Import your dataset module (must be next to this script or on PYTHONPATH)
-from dataset import (
-    LabeledStateDataset,
-    load_dataset_from_directory,
-    collate_batch,
-)
-MAX_FEATURES = 2000000
+DATA_DIR = f"data/{DECK_NAME}/ver{VER_NUMBER}/{SPLIT}"
+MODEL_DIR = f"models/{DECK_NAME}/ver{VER_NUMBER}"
+IGNORE_PATH = os.path.join(MODEL_DIR, "ignore.roar")
 
-# ---------- Helpers (pure Python; do not modify dataset.py) ----------
 
-def set_ignore_list(ds, ignore: Set[int]):
-    """Apply a global ignore set to all sub-datasets."""
-    if isinstance(ds, ConcatDataset):
-        for sub in ds.datasets:
-            set_ignore_list(sub, ignore)
-    elif isinstance(ds, LabeledStateDataset):
-        ds.ignore_list = set(ignore)
+# --------------------
+# Small helpers
+# --------------------
+def _dataloader(ds, bs=512):
+    return DataLoader(
+        ds, batch_size=bs, shuffle=False,
+        collate_fn=collate_batch, num_workers=0, pin_memory=True
+    )
 
-def unique_active_feature_count(dataset) -> int:
-    """
-    Count unique active feature indices across *any* Dataset (Subset, ConcatDataset, etc.).
-    Uses __getitem__ so filters are respected.
-    """
+def _maybe_load_ignore() -> Iterable[int] | None:
+    if os.path.exists(IGNORE_PATH):
+        try:
+            from pyroaring import BitMap
+            with open(IGNORE_PATH, "rb") as f:
+                bm = BitMap.deserialize(f.read())
+            print(f"[info] loaded ignore.roar: {len(bm)} indices")
+            return bm
+        except Exception as e:
+            print(f"[warn] failed to load ignore.roar: {e}")
+    return None
+
+def _apply_ignore(ds: H5Indexed, ignore: Iterable[int] | None):
+    if ignore is not None:
+        ds.ignore_list = ignore
+
+def _unique_active_feature_count(ds: H5Indexed) -> int:
     seen = set()
-    n = len(dataset)
-    for i in range(n):
-        indices, _, _ = dataset[i]   # (indices, policy, value)
-        seen.update(indices.tolist())
+    for batch_indices, *_ in _dataloader(ds, bs=1024):
+        if batch_indices.numel():
+            seen.update(batch_indices.tolist())
     return len(seen)
 
 
-def redundancy_analysis(dataset, num_global_features: int):
-    """
-    Find redundant/unseen features across *any* Dataset (Subset, ConcatDataset, etc.)
-    using __getitem__, so Subset filtering is respected.
-    """
-    from scipy.sparse import coo_matrix
+# --------------------
+# Streaming stats
+# --------------------
+def stream_stats(ds: H5Indexed):
+    """Stream once and collect per-head average policy + value histogram data."""
+    dl = _dataloader(ds, bs=512)
 
-    rows_list, cols_list = [], []
-    sample_id = 0
-    n = len(dataset)
+    pA_sum = torch.zeros(PRIORITY_A_MAX, dtype=torch.float32)
+    pB_sum = torch.zeros(PRIORITY_B_MAX, dtype=torch.float32)
+    t_sum  = torch.zeros(TARGETS_MAX,   dtype=torch.float32)
+    b_sum  = torch.zeros(BINARY_MAX,    dtype=torch.float32)
 
-    for i in range(n):
-        indices, _, _ = dataset[i]
-        if indices.numel() > 0:
-            rows_list.append(np.full(indices.shape, sample_id, dtype=np.int32))
-            cols_list.append(indices.numpy().astype(np.int32, copy=False))
-        sample_id += 1
+    nA = nB = nT = nB2 = 0
+    vals = []
 
-    if rows_list:
-        rows = np.concatenate(rows_list)
-        cols = np.concatenate(cols_list)
-    else:
-        rows = np.empty(0, dtype=np.int32)
-        cols = np.empty(0, dtype=np.int32)
+    with torch.no_grad():
+        for batch in dl:
+            idx, off, policy, value, is_player, action_type = batch
+            # decision masks (same semantics as train.py)
+            nonzero = (policy > 0).sum(dim=1)
+            decision_mask = nonzero > 1
+            if decision_mask.any():
+                is_p = is_player.squeeze(-1) > 0
+                a_t  = action_type.squeeze(-1).to(torch.long)
+                mask_pA = (a_t == ActionType.PRIORITY.value) & is_p & decision_mask
+                mask_pB = (a_t == ActionType.PRIORITY.value) & (~is_p) & decision_mask
+                mask_t  = (a_t == ActionType.CHOOSE_TARGET.value) & decision_mask
+                mask_b  = (a_t == ActionType.CHOOSE_USE.value) & decision_mask
 
-    data = np.ones_like(cols, dtype=np.uint8)
-    num_samples = sample_id
+                if mask_pA.any():
+                    pA_sum += policy[mask_pA, :PRIORITY_A_MAX].sum(dim=0)
+                    nA += int(mask_pA.sum().item())
+                if mask_pB.any():
+                    pB_sum += policy[mask_pB, :PRIORITY_B_MAX].sum(dim=0)
+                    nB += int(mask_pB.sum().item())
+                if mask_t.any():
+                    t_sum  += policy[mask_t, :TARGETS_MAX].sum(dim=0)
+                    nT += int(mask_t.sum().item())
+                if mask_b.any():
+                    b_sum  += policy[mask_b, :BINARY_MAX].sum(dim=0)
+                    nB2 += int(mask_b.sum().item())
 
-    X_csc = coo_matrix(
-        (data, (rows, cols)),
-        shape=(num_samples, num_global_features),
-        dtype=np.uint8
-    ).tocsc()
-
-    groups = {}
-    indptr, indices = X_csc.indptr, X_csc.indices
-    for j in range(num_global_features):
-        start, end = indptr[j], indptr[j + 1]
-        key = tuple(indices[start:end])  # () means unseen
-        groups.setdefault(key, []).append(j)
-
-    unseen_cols = groups.get((), [])
-    num_unseen = len(unseen_cols)
-    num_present_cols = sum(1 for k in groups.keys() if k != ())
-    num_duplicate_groups = sum(1 for k, v in groups.items() if k != () and len(v) > 1)
-    num_redundant_present = sum((len(v) - 1) for k, v in groups.items() if k != () and len(v) > 1)
-    num_nonredundant_present = num_present_cols
-    kept_global = num_global_features - (num_unseen + num_redundant_present)
-
-    ignore = set(unseen_cols)
-    for k, v in groups.items():
-        if k == () or len(v) <= 1:
-            continue
-        ignore.update(sorted(v)[1:])
+            vals.extend(torch.atleast_1d(value).squeeze(-1).tolist())
 
     return {
-        "num_samples": num_samples,
-        "num_unseen": num_unseen,
-        "num_present_cols": num_present_cols,
-        "num_duplicate_groups": num_duplicate_groups,
-        "num_redundant_present": num_redundant_present,
-        "num_nonredundant_present": num_nonredundant_present,
-        "kept_global": kept_global,
-        "ignore_set": ignore,
-    }
-def stream_policy_value_stats(dataset):
-    """
-    Stream the dataset to collect:
-      - avg_policy (mean over samples)
-      - label_vals (raw values for histogram)
-      - num_samples (count)
-    """
-    dl = DataLoader(dataset, batch_size=512, shuffle=False, collate_fn=collate_batch)
-    policy_sum = None
-    n = 0
-    label_vals = []
-
-    for indices, offsets, policies, values in dl:
-        if policies.numel() == 0:
-            continue
-        B, A = policies.shape
-        if policy_sum is None:
-            policy_sum = torch.zeros(A, dtype=torch.float32)
-        policy_sum += policies.sum(dim=0)
-        n += B
-        label_vals.extend(torch.atleast_1d(values).squeeze(-1).tolist())
-
-    avg_policy = (policy_sum / max(n, 1)).cpu().numpy() if policy_sum is not None else np.array([], dtype=np.float32)
-    label_vals = np.array(label_vals, dtype=np.float32)
-    return {
-        "avg_policy": avg_policy,
-        "label_vals": label_vals,
-        "num_samples": n,
+        "avg_player_priority": (pA_sum / max(nA, 1)).cpu().numpy(),
+        "avg_opponent_priority": (pB_sum / max(nB, 1)).cpu().numpy(),
+        "avg_targets": (t_sum / max(nT, 1)).cpu().numpy(),
+        "avg_binary": (b_sum / max(nB2, 1)).cpu().numpy(),
+        "values": np.array(vals, dtype=np.float32),
+        "num_samples": len(ds),
+        "counts": {"pA": nA, "pB": nB, "t": nT, "b": nB2},
     }
 
-def plot_value_histogram(label_vals: np.ndarray, bins: int, title: str, save_path: str | None):
+
+# --------------------
+# Plotting
+# --------------------
+def plot_value_hist(vals: np.ndarray, bins: int, title: str, out: str | None):
     edges = np.linspace(-1.0, 1.0, bins + 1)
     plt.figure()
-    plt.hist(label_vals, bins=edges)
+    plt.hist(vals, bins=edges)
     plt.xlabel("Value label")
     plt.ylabel("Count")
     plt.title(title)
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, bbox_inches="tight")
+    if out:
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        plt.savefig(out, bbox_inches="tight")
     if SHOW_PLOTS:
         plt.show()
     plt.close()
 
-def plot_avg_policy(avg_policy: np.ndarray, top_k: int, title: str, save_path: str | None):
-    A = len(avg_policy)
+def plot_avg_bar(arr: np.ndarray, k: int, title: str, out: str | None):
+    A = len(arr)
     if A == 0:
-        print("Average policy plot skipped (no actions found).")
+        print(f"[skip] {title} (no actions present)")
         return
-    k = max(1, min(A, top_k))
-    xs = np.arange(k)
-    ys = avg_policy[:k]
+    kk = max(1, min(A, k))
+    xs = np.arange(kk); ys = arr[:kk]
     plt.figure()
     plt.bar(xs, ys)
     plt.xlabel("Action index (0..K-1)")
-    plt.ylabel("Mean policy value")
-    plt.title(f"{title} | A={A}, showing first {k}")
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, bbox_inches="tight")
+    plt.ylabel("Mean policy label (train target)")
+    plt.title(f"{title} | A={A}, first {kk}")
+    if out:
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        plt.savefig(out, bbox_inches="tight")
     if SHOW_PLOTS:
         plt.show()
     plt.close()
 
-def preview_samples(dataset, N: int = 50, max_indices_to_show: int = 100) -> str:
-    dl = DataLoader(dataset, batch_size=1, shuffle=False, collate_fn=collate_batch)
-    out_lines = []
-    for i, (indices_batch, offsets_batch, policies_batch, values_batch) in enumerate(dl):
-        if i >= N:
-            break
-        idxs = indices_batch.tolist()
-        if len(idxs) > max_indices_to_show:
-            sb = " ".join(map(str, idxs[:max_indices_to_show])) + " ..."
-        else:
-            sb = " ".join(map(str, idxs)) if idxs else "[No active features]"
-        pol = policies_batch[0].tolist()
-        try:
-            val = float(torch.atleast_1d(values_batch).squeeze(-1)[0].item())
-        except Exception:
-            val = float(values_batch[0].item())
-        out_lines.append(f"State: {sb}\nAction: {pol}\nValue: {val:+.4f}\n")
-    return "\n".join(out_lines)
 
+# --------------------
+# Preview
+# --------------------
+def preview(ds: H5Indexed, n=PREVIEW_N, max_idx=96) -> str:
+    dl = _dataloader(ds, bs=1)
+    lines = []
+    for i, batch in enumerate(dl):
+        if i >= n: break
+        idxs, off, pol, val, is_p, a_t = batch
+        idxs = idxs.tolist()
+        idx_str = " ".join(map(str, idxs[:max_idx])) + (" ..." if len(idxs) > max_idx else "")
+        valf = float(torch.atleast_1d(val).squeeze(-1)[0].item())
+        ispf = bool(int(is_p.squeeze(-1)[0].item()))
+        aty  = int(a_t.squeeze(-1)[0].item())
+        lines.append(
+            f"State[{i}]: {idx_str}\n"
+            f"  actionType={aty} isPlayer={ispf}  value={valf:+.4f}\n"
+            f"  policy[:16]={pol[0, :16].tolist()}\n"
+        )
+    return "\n".join(lines)
+
+
+# --------------------
+# Main
+# --------------------
 def main():
-    # Resolve global feature count
-    num_global = int(MAX_FEATURES)
+    print(f"[load] {DATA_DIR}")
+    ds = H5Indexed(DATA_DIR)
+    print(f"[stats] samples={len(ds)}")
 
-    # 1) Load and combine datasets
-    full_dataset = load_dataset_from_directory(DATA_DIR)
-    #full_dataset = remove_one_hot_labels(full_dataset)
-    total_samples = len(full_dataset)
-    print(f"\n=== Loaded dataset ===")
-    print(f"Path: {DATA_DIR}")
-    print(f"Total samples: {total_samples}")
+    # Ignore list: prefer saved ignore.roar, otherwise (optionally) compute
+    ignore = _maybe_load_ignore()
+    if ignore is None and APPLY_IGNORE:
+        print("[info] computing ignore list (redundancy) from dataset…")
+        ignore_list = create_redundancy_ignore_list(ds, GLOBAL_MAX)
+        print(f"[info] ignore computed: {len(ignore_list)} indices")
+        ignore = ignore_list
 
-    # 2) Unique active feature count
-    uniq_count = unique_active_feature_count(full_dataset)
-    print(f"Unique active feature indices (present in data): {uniq_count}")
+    if APPLY_IGNORE and ignore is not None:
+        _apply_ignore(ds, ignore)
+        print("[info] ignore applied")
 
-    # 3) Redundancy analysis
+    uniq = _unique_active_feature_count(ds)
+    print(f"[stats] unique active feature indices={uniq}")
 
-    print("\n=== Redundancy analysis ===")
-    ra = redundancy_analysis(full_dataset, num_global)
-    print(f"Samples scanned: {ra['num_samples']}")
-    print(f"Unseen features (never active): {ra['num_unseen']}")
-    print(f"Present feature columns: {ra['num_present_cols']}")
-    print(f"Duplicate groups among present: {ra['num_duplicate_groups']}")
-    print(f"Redundant present features (to drop): {ra['num_redundant_present']}")
-    print(f"Non-redundant features among PRESENT: {ra['num_nonredundant_present']}")
-    print(f"Non-redundant features GLOBAL (kept after dropping unseen & dups): {ra['kept_global']}")
-    
-    if APPLY_IGNORE:
-        set_ignore_list(full_dataset, ra["ignore_set"])
-        print("Applied ignore set to dataset (unseen + redundant).")
+    sv = stream_stats(ds)
+    print(f"[stats] aggregated samples={sv['num_samples']} "
+          f"(pA={sv['counts']['pA']}, pB={sv['counts']['pB']}, "
+          f"t={sv['counts']['t']}, b={sv['counts']['b']})")
 
-    # 4) Stream once for value histogram + average policy
-    print("\n=== Value label histogram & average policy ===")
-    sv = stream_policy_value_stats(full_dataset)
-    print(f"Samples aggregated: {sv['num_samples']}")
-
-    # 5) Plot figures
     if SAVE_PLOTS and not os.path.exists(OUT_DIR):
         os.makedirs(OUT_DIR, exist_ok=True)
 
-    hist_path = os.path.join(OUT_DIR, "value_histogram.png") if SAVE_PLOTS else None
-    plot_value_histogram(
-        sv["label_vals"],
-        bins=HIST_BINS,
-        title="Value label distribution (-1..1)",
-        save_path=hist_path
+    # value histogram
+    plot_value_hist(
+        sv["values"], HIST_BINS, f"Value labels ({DECK_NAME} v{VER_NUMBER} {SPLIT})",
+        os.path.join(OUT_DIR, f"value_hist_{DECK_NAME}_v{VER_NUMBER}_{SPLIT}.png") if SAVE_PLOTS else None
     )
-    if SAVE_PLOTS:
-        print(f"Saved value histogram → {hist_path}")
 
-    policy_path = os.path.join(OUT_DIR, "avg_policy_firstK.png") if SAVE_PLOTS else None
-    plot_avg_policy(
-        sv["avg_policy"],
-        top_k=POLICY_TOP_K,
-        title="Average policy (mean over samples)",
-        save_path=policy_path
+    # per-head avg policy bars
+    plot_avg_bar(
+        sv["avg_player_priority"], TOP_K, "Avg policy – Player PRIORITY",
+        os.path.join(OUT_DIR, f"avg_policy_pA_{DECK_NAME}_v{VER_NUMBER}_{SPLIT}.png") if SAVE_PLOTS else None
     )
-    if SAVE_PLOTS:
-        print(f"Saved average policy bar chart → {policy_path}")
+    plot_avg_bar(
+        sv["avg_opponent_priority"], TOP_K, "Avg policy – Opponent PRIORITY",
+        os.path.join(OUT_DIR, f"avg_policy_pB_{DECK_NAME}_v{VER_NUMBER}_{SPLIT}.png") if SAVE_PLOTS else None
+    )
+    plot_avg_bar(
+        sv["avg_targets"], TOP_K, "Avg policy – CHOOSE_TARGET",
+        os.path.join(OUT_DIR, f"avg_policy_target_{DECK_NAME}_v{VER_NUMBER}_{SPLIT}.png") if SAVE_PLOTS else None
+    )
+    plot_avg_bar(
+        sv["avg_binary"], TOP_K, "Avg policy – CHOOSE_USE",
+        os.path.join(OUT_DIR, f"avg_policy_binary_{DECK_NAME}_v{VER_NUMBER}_{SPLIT}.png") if SAVE_PLOTS else None
+    )
 
-    # 6) Sample preview
-    print(f"\n=== First {PREVIEW_N} samples ===")
-    print(preview_samples(full_dataset, N=PREVIEW_N, max_indices_to_show=100))
+    print("\n=== Preview ===")
+    print(preview(ds, PREVIEW_N))
+
 
 if __name__ == "__main__":
     main()

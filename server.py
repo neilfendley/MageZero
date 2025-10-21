@@ -10,36 +10,29 @@ import msgpack
 import threading, time
 from queue import Queue, Empty
 
-import train  # provides Net, GLOBAL_MAX, ACTIONS_MAX
-from train import DECK_NAME, VER_NUMBER, GLOBAL_MAX, ACTIONS_MAX
+from train import Net, DECK_NAME, VER_NUMBER, GLOBAL_MAX, ACTIONS_MAX
 
 MODEL_DIR = f"models/{DECK_NAME}/ver{VER_NUMBER}"
 IGNORE = MODEL_DIR + "/ignore.roar"
 MODEL = MODEL_DIR + "/model.pt"
 
-# -------------------------
 # Model + ignore list setup
-# -------------------------
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Load ignore bitmap (created during training)
-# (train.py writes models/{DECK}/ver{VER}/ignore.roar)  # :contentReference[oaicite:2]{index=2}
 with open(IGNORE, "rb") as f:
     IGNORE_BM = BitMap.deserialize(f.read())
 
 # Load model checkpoint (policy logits + value)  # :contentReference[oaicite:3]{index=3}
-model = train.Net(GLOBAL_MAX, ACTIONS_MAX).to(DEVICE).eval()
+server_model = Net(GLOBAL_MAX, ACTIONS_MAX).to(DEVICE).eval()
 ckpt = torch.load(MODEL, map_location=DEVICE)
-model.load_state_dict(ckpt["model_state_dict"])
+server_model.load_state_dict(ckpt["model_state_dict"])
 
 # Optional CPU threading tuning
-
 TORCH_THREADS = max(1, os.cpu_count() // 2)
 torch.set_num_threads(TORCH_THREADS)
 
-# -------------------------
 # Flask app with (optional) micro-batching
-# -------------------------
 app = Flask(__name__)
 
 BATCH_MS: float = 0.0   # 0 = no micro-batching now; set to 1–3 later if desired
@@ -87,11 +80,21 @@ def worker_loop():
             idx = batch[0].idx
             off = batch[0].off
             with torch.no_grad():
-                pol, val = model(idx, off)   # Net forward returns logits + tanh value  # :contentReference[oaicite:5]{index=5}
+                pA, pB, tgt, bin2, val = server_model(idx, off)   # Net forward returns logits + tanh value  # :contentReference[oaicite:5]{index=5}
             # Shapes: [1, A], [1]
-            pol = pol.detach().to("cpu")
+            pA = pA.detach().to("cpu")
+            pB = pB.detach().to("cpu")
+            tgt = tgt.detach().to("cpu")
+            bin2 = bin2.detach().to("cpu")
             val = val.detach().to("cpu")
-            batch[0].out = {"policy": pol[0].tolist(), "value": float(val[0].item())}
+
+            batch[0].out = {
+                "policy_player": pA[0].tolist(),  # length = ACTIONS_MAX
+                "policy_opponent": pB[0].tolist(),  # length = ACTIONS_MAX
+                "policy_target": tgt[0].tolist(),  # length = ACTIONS_MAX
+                "policy_binary": bin2[0].tolist(),  # length = 2
+                "value": float(val[0].item())
+            }
             batch[0].t_done = time.perf_counter()
             batch[0].evt.set()
         else:
@@ -109,11 +112,22 @@ def worker_loop():
             off = torch.tensor(offsets, dtype=torch.long, device=DEVICE)
 
             with torch.no_grad():
-                pol, val = model(idx, off)   # [B, A], [B]
-            pol = pol.detach().to("cpu")
+                pA, pB, tgt, bin2, val = server_model(idx, off)  # [B, A], [B, A], [B, A], [B, 2], [B]
+
+            pA = pA.detach().to("cpu")
+            pB = pB.detach().to("cpu")
+            tgt = tgt.detach().to("cpu")
+            bin2 = bin2.detach().to("cpu")
             val = val.detach().to("cpu")
+
             for i, p in enumerate(batch):
-                p.out = {"policy": pol[i].tolist(), "value": float(val[i].item())}
+                p.out = {
+                    "policy_player": pA[i].tolist(),
+                    "policy_opponent": pB[i].tolist(),
+                    "policy_target": tgt[i].tolist(),
+                    "policy_binary": bin2[i].tolist(),
+                    "value": float(val[i].item())
+                }
                 p.t_done = time.perf_counter()
                 p.evt.set()
 

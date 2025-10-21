@@ -2,52 +2,65 @@
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
+from typing import List, Tuple
 from pathlib import Path  # Use the modern pathlib for handling file paths
 import sys
 from typing import Set
-from fastavro import block_reader
 from scipy.sparse import coo_matrix
+import h5py
+
 
 #from train import GLOBAL_MAX
 GLOBAL_MAX = 2000000
 
-# compact structured dtype for (file_id, block_offset, index_within_block)
-RECIDX_DTYPE = np.dtype([("file", np.int32), ("off", np.int64), ("i", np.int32)])
+H5_RECIDX_DTYPE = np.dtype([("file", "i4"), ("row", "i8")])
 
-
-class AvroIndexed(Dataset):
+class H5Indexed(Dataset):
     """
-    An indexed, lazy-loading dataset built on top of a collection of .avro files.\n
-    stores(sparse indices [], policy label [128], value label float, player perspective bool, action type enum) for each record
+    Lazy, indexed dataset over one or more HDF5 files produced by XMage JHDF5 writer.
+
+    Expected datasets per file:
+      /indices     (int32, shape [NNZ])
+      /offsets     (int64, shape [N+1], offsets[0]==0, offsets[-1]==len(indices))
+      /action      (float32 or float64, shape [N, 128])
+      /isPlayer    (uint8, shape [N])
+      /actionType  (int32, shape [N])
+      /stateScore  (float32 or float64, shape [N])
+      /resultLabel (float32 or float64, shape [N])
     """
 
-    def __init__(self, dir_path):
-        print(f"Searching for dataset files in: {dir_path}")
-        avro_paths = sorted(list(Path(dir_path).glob('*.avro')))
-        self.files = [str(Path(p)) for p in avro_paths]
-        self.fhs = None
-        if not self.files:
-            raise ValueError("No .avro paths provided")
-        rows = []
-        #create index
-        for fid, path in enumerate(self.files):
-            with open(path, "rb") as f:
-                for blk in block_reader(f):
-                    n = int(blk.num_records)
-                    if n <= 0:
-                        continue
-                    a = np.empty(n, dtype=RECIDX_DTYPE)
-                    a["file"].fill(fid)
-                    a["off"].fill(int(blk.offset))
-                    a["i"] = np.arange(n, dtype=np.int32)
-                    rows.append(a)
-        self.idx = np.concatenate(rows) if rows else np.empty(0, dtype=RECIDX_DTYPE)
-        print("Found {} records".format(len(self.idx)))
+    def __init__(self, dir_path: str):
+        p = Path(dir_path)
+        # pick up .h5 / .hdf5
+        h5_paths = sorted(list(p.glob("*.h5")) + list(p.glob("*.hdf5")))
+        self.files: List[str] = [str(pp) for pp in h5_paths]
+
+        self.fhs: List[h5py.File] = []
         self.ignore_list = set()
 
+        if not self.files:
+            print(f"No .h5/.hdf5 files in {dir_path}")
+            return
 
+        # Build a flat (file,row) index
+        rows: List[np.ndarray] = []
+        total = 0
+        for fid, path in enumerate(self.files):
+            with h5py.File(path, "r") as f:
+                n, _= f["/action"].shape
+                if n > 0:
+                    a = np.empty(n, dtype=H5_RECIDX_DTYPE)
+                    a["file"].fill(fid)
+                    a["row"] = np.arange(n, dtype=np.int64)
+                    rows.append(a)
+                    total += n
+
+        self.idx = np.concatenate(rows) if rows else np.empty(0, dtype=H5_RECIDX_DTYPE)
+        print(f"Found {len(self.idx)} rows across {len(self.files)} file(s)")
 
     def __len__(self) -> int:
+        if not self.files:
+            return 0
         return int(self.idx.shape[0])
 
     def __del__(self):
@@ -59,38 +72,59 @@ class AvroIndexed(Dataset):
                     pass
 
     def ensure_open(self):
-        if self.fhs is None:
-            self.fhs = [open(p, "rb") for p in self.files]
-    def get_record(self, file_id: int, off: int, rec: int):
-        """
-        Seek to a block at 'off' in file 'file_id', and return the i-th record from that block.
-        """
-        self.ensure_open()
-        blk = next(block_reader(self.fhs[file_id], start=int(off)))
-        return blk.records[rec]
+        if not self.fhs:
+            # Big raw data chunk cache (rdcc_*), no SWMR for faster reads
+            self.fhs = [
+                h5py.File(
+                    p, "r",
+                    swmr=False,  # faster if you don't need live-writes
+                    rdcc_nbytes=128 * 1024 * 1024*10,  # 128MB cache
+                    rdcc_nslots=1_000_003,  # large hash table to reduce collisions
+                    rdcc_w0=0.75
+                )
+                for p in self.files
+            ]
+
+    def _fetch_row(self, fid: int, row: int):
+        f = self.fhs[fid]
+
+        off = f["/offsets"]
+        a = int(off[row]);
+        b = int(off[row + 1])
+        sv_idx = f["/indices"][a:b]  # 1 read
+
+        row_full = f["/row"][row, :]  # 1 read (A+4)
+        A = row_full.shape[0] - 4
+        action_row = row_full[:A]
+        resultLbl = float(row_full[A + 0])
+        stateScore = float(row_full[A + 1])
+        isP = int(row_full[A + 2] > 0.5)
+        actionType = int(row_full[A + 3])
+
+        return sv_idx, action_row, resultLbl, isP, actionType, stateScore
 
     def __getitem__(self, k: int):
+        self.ensure_open()
         ent = self.idx[k]
         fid = int(ent["file"])
-        off = int(ent["off"])
-        iwb = int(ent["i"])
+        row = int(ent["row"])
 
-        rec = self.get_record(fid, off, iwb)
+        sv_idx, action_row, resultLbl, isP, aTy, stateScore = self._fetch_row(fid, row)
 
-        # map Avro record -> tensors (match your training shapes)
-        idxs = rec["stateVector"] or []
+        # apply ignore_list (same as your H5 path)
         if self.ignore_list:
-            idxs = [j for j in idxs if j not in self.ignore_list]
+            sv_idx = [j for j in sv_idx.tolist() if j not in self.ignore_list]
+        else:
+            sv_idx = sv_idx.tolist()
 
+        # map to tensors with same shapes/dtypes you used before
         return (
-            torch.tensor(idxs, dtype=torch.long),                      # indices (ragged)
-            torch.tensor(rec["actionVector"], dtype=torch.float32),    # policy [A]
-            torch.tensor([float(rec["resultLabel"])], dtype=torch.float32),  # value [1]
-            torch.tensor([1.0 if rec["isPlayer"] else 0.0], dtype=torch.float32),  # is_player [1]
-            torch.tensor([int(rec["actionTypeCode"])], dtype=torch.long),          # action_type [1]
+            torch.tensor(sv_idx, dtype=torch.long),                       # ragged indices
+            torch.tensor(action_row, dtype=torch.float32),                # policy [A]
+            torch.tensor([resultLbl], dtype=torch.float32),               # value [1]
+            torch.tensor([1.0 if isP else 0.0], dtype=torch.float32),     # is_player [1]
+            torch.tensor([aTy], dtype=torch.long),                        # action_type [1]
         )
-
-
 def collate_batch(batch):
     """
     This collate function is essential for batching variable-length data.
@@ -199,14 +233,13 @@ def remove_one_hot_labels(dataset):
     return Subset(dataset, keep_indices)
 
 
-# --- Main execution block ---
 if __name__ == "__main__":
     # Define the directory where you save your game data files.
     data_directory = "data/MTGA_MonoU/ver7/training"
 
     try:
         # Load dataset from the specified folder
-        full_dataset = AvroIndexed(data_directory)
+        full_dataset = H5Indexed(data_directory)
 
         winning = 0
         num_samples_to_process = 0
@@ -240,7 +273,7 @@ if __name__ == "__main__":
 
             if lbl > 0:
                 winning += 1
-            if i >= 100:
+            if i >= 1000:
                 break
 
         print(f"\nDataset size: {len(full_dataset)}\n")

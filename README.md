@@ -60,7 +60,7 @@ See Results file
 
 ### 5. MCTS
 
-MageZero uses the same combination of MCTS with Deep learning that Deep Mind's AlphaZero, Muzero and other variants have used to play Go, Chess, Shogi, and other strategy games at a superhuman level. Specifically we use the PUCT formulat as was originally outlined in the AlphaZero paper. 
+MageZero uses the same combination of MCTS with Deep learning that Deep Mind's AlphaZero, Muzero and other variants have used to play Go, Chess, Shogi, and other strategy games at a superhuman level. Specifically we use the PUCT formula as was originally outlined in the AlphaZero paper. 
 
 $$a^* = \arg\max_a \left[ Q(s,a) + c_{\text{puct}} \, P(s,a) \, \frac{\sqrt{N(s)}}{1 + N(s,a)} \right]$$
 

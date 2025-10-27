@@ -8,11 +8,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import H5Indexed, collate_batch, create_redundancy_ignore_list
-from train import (
-    DECK_NAME, VER_NUMBER, GLOBAL_MAX,
-    ActionType,
-    PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX,
-)
+from train import DECK_NAME, VER_NUMBER, GLOBAL_MAX,ActionType, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX
+
 
 # --------------------
 # Config (edit here)

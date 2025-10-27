@@ -9,21 +9,25 @@ import math
 
 
 import test
-from dataset import H5Indexed, collate_batch,  create_redundancy_ignore_list
+from dataset import H5Indexed, collate_batch,  create_redundancy_ignore_list, filter_opponent_states
 from pyroaring import BitMap
 
+#add training data under: data/{deck name}/ver{1..10}/training/*.hdf5
+DECK_NAME = "UWTempo"
+VER_NUMBER = 1
+
 MAKE_IGNORE_LIST = True
+TRAIN_OPPONENT_HEAD = False #turn off when training on round-robin data
 ACTIONS_MAX = 128
 GLOBAL_MAX = 2000000
 EPOCH_COUNT = 60
-VER_NUMBER = 9
-DECK_NAME = "MTGA_MonoU"
+
 
 #TODO: wire into xmage data pipeline
-#for now just manually enter your matchup-specific action spaces here for optimal normalization(in XMage run getActionsSpaces())
-PRIORITY_A_MAX = 21
+#for now just manually enter your matchup-specific action space sizes here for optimal normalization(in XMage run getActionsSpaces())
+PRIORITY_A_MAX = 28
 PRIORITY_B_MAX = 22
-TARGETS_MAX = 38
+TARGETS_MAX = 19 #for round-robin only go up to targets from own deck
 BINARY_MAX = 2
 
 def head_weight(K: int) -> float:
@@ -49,7 +53,7 @@ class ActionType(Enum):
 
 """
 MageZero Neural Network architecture for AlphaZero style MCTS:
-2M sparse embedding bag -> 512D hidden layer -> 256D hidden layer -> (3 x 128D policy heads + 2D binary policy head + 1D value head)
+2M sparse embedding bag -> 512D embedding layer -> 256D hidden layer -> (3 x 128D policy heads + 2D binary policy head + 1D value head)
 
 Policy heads are for each decision type (disjoint action spaces) they are:
 128D PriorityA (priority actions for PlayerA - which is this agent)
@@ -106,36 +110,44 @@ def normalize_policy_labels(raw: torch.Tensor) -> torch.Tensor:
 def train():
     os.makedirs(f"models/{DECK_NAME}/ver{VER_NUMBER}", exist_ok=True)
     ds_raw = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training")
-    #combined_ds = AvroIndexed("data/UWTempo/ver3/training/training.bin")
+    #ignore handling
     print("Generating ignore list for combined dataset. to use for model")
     ignore_list = create_redundancy_ignore_list(ds_raw)
     if not MAKE_IGNORE_LIST: ignore_list = []
-    ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training", ignore_list)
     print("Saving ignore list to ignore.roar")
     ignore = BitMap(ignore_list)  # iterable of ints
-    print(len(ignore))
     with open(f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar", "wb") as f:
         f.write(ignore.serialize())
+
+    #data sets with redundant filter
+    ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training", ignore_list)
+    test_ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/testing", ignore_list)
+    #if round-robin filter out opponent state AFTER making the ignore list
+    if not TRAIN_OPPONENT_HEAD:
+        ds = filter_opponent_states(ds,TARGETS_MAX)
+        test_ds = filter_opponent_states(test_ds,TARGETS_MAX)
+
+    #model and data loaders
     model = Net(GLOBAL_MAX, ACTIONS_MAX).cuda()
     dl = DataLoader(ds, batch_size=128, shuffle=True, num_workers=0, collate_fn=collate_batch,
                     pin_memory=True, persistent_workers=False)
-    #make validation dl (can be empty)
-    test_ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/testing", ignore_list)
+
     dl_test = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=0, collate_fn=collate_batch,
                     pin_memory=True, persistent_workers=False)
 
     test.SHOW_CONFUSION_MATRIX = False
 
+    #optimizers
     sparse_params = model.embedding_bag.parameters()
     opt_sparse = optim.SparseAdam(sparse_params, lr=5e-4)#optim.SparseAdam(sparse_params, lr=1e-3)
-
     dense_params = []
     for name, param in model.named_parameters():
         if "embedding_bag" not in name:  # Exclude embedding_bag parameters
             dense_params.append(param)
     opt_dense = optim.Adam(dense_params, lr=5e-4)
 
-    checkpoint_path = f"models/model0/ckpt_0.pt"  #optional start point
+    # optional start point
+    checkpoint_path = f"models/model0/ckpt_0.pt"
 
     try:
         checkpoint = torch.load(checkpoint_path, map_location="cuda")
@@ -154,7 +166,7 @@ def train():
     mse = nn.MSELoss()
     kld = nn.KLDivLoss(reduction='batchmean')
 
-
+    #main training loop
     for epoch in range(1, EPOCH_COUNT+1):
         total_pA_loss, total_pB_loss, total_t_loss, total_b_loss, total_v_loss = 0.0, 0.0, 0.0, 0.0, 0.0  # Initialize as floats
         total_decision_examples, total_pA_examples, total_pB_examples, total_t_examples, total_b_examples = 0,0,0,0,0
@@ -180,6 +192,7 @@ def train():
             opponent_priority_mask = (action_types==ActionType.PRIORITY.value) & (~is_players) & decision_mask
             target_mask = (action_types==ActionType.CHOOSE_TARGET.value) & decision_mask
             binary_mask = (action_types==ActionType.CHOOSE_USE.value) & decision_mask
+
 
             total_decision_examples += decision_mask.sum().item()
 

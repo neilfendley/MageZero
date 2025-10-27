@@ -10,8 +10,7 @@ import msgpack
 import threading, time
 from queue import Queue, Empty
 
-from train import Net, DECK_NAME, VER_NUMBER, GLOBAL_MAX, ACTIONS_MAX
-
+from train import Net, GLOBAL_MAX, ACTIONS_MAX, VER_NUMBER, DECK_NAME
 MODEL_DIR = f"models/{DECK_NAME}/ver{VER_NUMBER}"
 IGNORE = MODEL_DIR + "/ignore.roar"
 MODEL = MODEL_DIR + "/model.pt"

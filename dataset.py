@@ -10,7 +10,6 @@ from scipy.sparse import coo_matrix
 import h5py
 
 
-#from train import GLOBAL_MAX
 GLOBAL_MAX = 2000000
 
 H5_RECIDX_DTYPE = np.dtype([("file", "i4"), ("row", "i8")])
@@ -32,18 +31,18 @@ class H5Indexed(Dataset):
         self.files = [str(pp) for pp in h5_paths]
 
         if not self.files:
-            self.N = 0;
+            self.N = 0
             self.A = 0
-            self.indptr_t = torch.zeros(1, dtype=torch.long)
+            self.idxptr_t = torch.zeros(1, dtype=torch.long)
             self.indices_t = torch.empty(0, dtype=torch.int32)
             self.row_t = torch.empty(0, 0, dtype=torch.float32)
             return
 
-        indptr = [0];
-        indices_chunks = [];
+        idxptr = [0]
+        indices_chunks = []
         row_chunks = []
-        nnz_cum = 0;
-        N_total = 0;
+        nnz_cum = 0
+        N_total = 0
         A_ref = None
 
         for path in self.files:
@@ -59,15 +58,15 @@ class H5Indexed(Dataset):
                 else:
                     assert A_local == A_ref, "Inconsistent A across shards"
 
-                indices_chunks.append(idx);
+                indices_chunks.append(idx)
                 row_chunks.append(row)
-                if N > 0: indptr.extend((off[1:] + nnz_cum).tolist())
-                nnz_cum += nnz;
+                if N > 0: idxptr.extend((off[1:] + nnz_cum).tolist())
+                nnz_cum += nnz
                 N_total += N
 
         self.N = N_total;
         self.A = A_ref if A_ref is not None else 0
-        indptr_np = np.asarray(indptr, dtype=np.int64)  # [N+1]
+        idxptr_np = np.asarray(idxptr, dtype=np.int64)  # [N+1]
         indices_np = (np.concatenate(indices_chunks) if indices_chunks
                       else np.empty(0, dtype=np.int32))  # [nnz]
         row_np = (np.concatenate(row_chunks, axis=0) if row_chunks
@@ -77,40 +76,38 @@ class H5Indexed(Dataset):
         if ignore:
             ign = np.fromiter(ignore, dtype=np.int32)
             keep_all = ~np.isin(indices_np, ign, assume_unique=False)
-            new_indptr = np.empty_like(indptr_np)
-            new_indptr[0] = 0
+            new_idxptr = np.empty_like(idxptr_np)
+            new_idxptr[0] = 0
             write_pos = 0
             for i in range(self.N):
-                a = indptr_np[i];
-                b = indptr_np[i + 1]
+                a = idxptr_np[i]
+                b = idxptr_np[i + 1]
                 if b > a:
-                    m = keep_all[a:b];
+                    m = keep_all[a:b]
                     L = int(m.sum())
                     if L:
                         # compact kept indices forward (single pass)
                         src = indices_np[a:b][m]
                         indices_np[write_pos:write_pos + L] = src
-                    new_indptr[i + 1] = write_pos + L
+                    new_idxptr[i + 1] = write_pos + L
                     write_pos += L
                 else:
-                    new_indptr[i + 1] = write_pos
+                    new_idxptr[i + 1] = write_pos
             indices_np = indices_np[:write_pos]
-            indptr_np = new_indptr
-        # -------------------------------------
+            idxptr_np = new_idxptr
 
         # store as tensors; __getitem__ uses zero-copy views
-        self.indptr_t = torch.from_numpy(indptr_np)  # int64 [N+1]
+        self.idxptr_t = torch.from_numpy(idxptr_np)  # int64 [N+1]
         self.indices_t = torch.from_numpy(indices_np)  # int32 [nnz]
         self.row_t = torch.from_numpy(row_np)  # float32 [N,A+4]
-
 
 
     def __len__(self) -> int:
         return int(self.N)
 
     def __getitem__(self, k: int):
-        a = int(self.indptr_t[k].item())
-        b = int(self.indptr_t[k + 1].item())
+        a = int(self.idxptr_t[k].item())
+        b = int(self.idxptr_t[k + 1].item())
 
         sv_idx_t = self.indices_t.narrow(0, a, b - a)  # int32 view
         row_k = self.row_t[k]  # float32 [A+4] view
@@ -207,7 +204,7 @@ def create_redundancy_ignore_list(ds) -> Set[int]:
 
     return ignore
 
-def remove_one_hot_labels(dataset):
+def filter_one_hots(dataset):
     """
     Return a torch.utils.data.Subset that excludes samples whose policy label is one-hot.
     """
@@ -226,15 +223,39 @@ def remove_one_hot_labels(dataset):
 
 
     removed = n - len(keep_indices)
-    print(f"[remove_one_hot_labels] scanned {n} samples "
+    print(f"[one hot filter] scanned {n} samples "
           f" kept {len(keep_indices)} (removed {removed} one-hot policies).")
+
+    return Subset(dataset, keep_indices)
+
+def filter_opponent_states(dataset, targets_max):
+    """
+    Return a torch.utils.data.Subset that excludes samples from opponent (Player B)'s perspective. and targeting samples that include opponent targets
+    """
+    keep_indices = []
+    n = len(dataset)
+
+
+    for i in range(n):
+        _, policy, _, is_player, d_type = dataset[i]  # (indices, policy, value, isPlayer, decision type)
+
+        if int(d_type.item()) == 3 and not (policy[:targets_max] > 0).any().item():
+            continue
+        if is_player:
+            keep_indices.append(i)
+
+
+    removed = n - len(keep_indices)
+    print(f"[opponent filter] scanned {n} samples "
+          f" kept {len(keep_indices)} (removed {removed} opponent states).")
 
     return Subset(dataset, keep_indices)
 
 
 if __name__ == "__main__":
+
     # Define the directory where you save your game data files.
-    data_directory = "data/MTGA_MonoU/ver9/training"
+    data_directory = "data/UWTempo/ver1/testing"
 
     try:
         # Load dataset from the specified folder
@@ -287,7 +308,7 @@ if __name__ == "__main__":
             print(f"Total unique feature indices in dataset: {len(all_feature_indices)}")
 
         if num_samples_to_process > 0:
-            print(f"Winrate (over {num_samples_to_process} samples): {winning / num_samples_to_process:.3f}")
+            print(f"Winning rate (over {num_samples_to_process} samples): {winning / num_samples_to_process:.3f}")
         else:
             print("No samples were processed.")
 

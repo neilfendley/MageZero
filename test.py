@@ -4,10 +4,8 @@ from pyroaring import BitMap
 from torch import nn  # optim is not strictly needed for testing if not optimizing
 from torch.utils.data import DataLoader
 
-# If Net is also in dataset.py or a separate model.py, adjust import accordingly.
-from dataset import H5Indexed, collate_batch, create_redundancy_ignore_list, remove_one_hot_labels  # CRITICAL: Import collate_batch
-from train import Net, normalize_policy_labels, ActionType, GLOBAL_MAX, ACTIONS_MAX, VER_NUMBER, DECK_NAME, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, lambda_pA, lambda_pB, lambda_t, lambda_b
-
+from dataset import H5Indexed, collate_batch, filter_opponent_states
+import train
 SHOW_CONFUSION_MATRIX = True
 
 mse = nn.MSELoss()
@@ -21,18 +19,30 @@ def print_matrix(matrix):
     print("--- Policy Confusion Matrix (True \\ Predicted) ---")
     matrix_size = matrix.shape[0]
 
-    # Print header for predicted actions
-    header = "True |" + "".join([f"{j: >4}" for j in range(matrix_size)])
-    print(header)
-    print("-" * len(header))
+    if matrix_size == 2:
+        # Print header for predicted actions
+        header = "  True   |" + "".join([f"{j: >8}" for j in range(matrix_size)])
+        print(header)
+        print("-" * len(header))
 
-    # Print each row for true actions
-    for r in range(matrix_size):
-        row_str = f"{r: >4} |"
-        row_str += "".join([f"{matrix[r, c].item(): >4}" for c in range(matrix_size)])
-        print(row_str)
+        # Print each row for true actions
+        for r in range(matrix_size):
+            row_str = f"{r: >8} |"
+            row_str += "".join([f"{matrix[r, c].item(): >8}" for c in range(matrix_size)])
+            print(row_str)
+    else:
+        # Print header for predicted actions
+        header = "True |" + "".join([f"{j: >4}" for j in range(matrix_size)])
+        print(header)
+        print("-" * len(header))
 
-    print("-" * 60)  # Separator for the next checkpoint
+        # Print each row for true actions
+        for r in range(matrix_size):
+            row_str = f"{r: >4} |"
+            row_str += "".join([f"{matrix[r, c].item(): >4}" for c in range(matrix_size)])
+            print(row_str)
+
+    print("-" * 60)
 def correct_from_matrix(matrix) -> int:
     return int(matrix.diag().sum().item())
 
@@ -44,10 +54,10 @@ def validate(model, dl):
     # Metrics accumulators
     total_decision_examples = 0
     total_combined_loss, total_pA_loss, total_pB_loss, total_t_loss, total_b_loss, total_v_loss = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0  # Initialize as floats
-    pA_matrix = torch.zeros(PRIORITY_A_MAX, PRIORITY_A_MAX, dtype=torch.long)
-    pB_matrix = torch.zeros(PRIORITY_B_MAX, PRIORITY_B_MAX, dtype=torch.long)
-    t_matrix = torch.zeros(TARGETS_MAX, TARGETS_MAX, dtype=torch.long)
-    b_matrix = torch.zeros(BINARY_MAX, BINARY_MAX, dtype=torch.long)
+    pA_matrix = torch.zeros(train.PRIORITY_A_MAX, train.PRIORITY_A_MAX, dtype=torch.long)
+    pB_matrix = torch.zeros(train.PRIORITY_B_MAX, train.PRIORITY_B_MAX, dtype=torch.long)
+    t_matrix = torch.zeros(train.TARGETS_MAX, train.TARGETS_MAX, dtype=torch.long)
+    b_matrix = torch.zeros(train.BINARY_MAX, train.BINARY_MAX, dtype=torch.long)
     model.eval()
     with torch.no_grad():
         for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in dl:
@@ -65,30 +75,30 @@ def validate(model, dl):
 
             nonzero = (batch_policy_labels > 0).sum(dim=1)  # [B]
             decision_mask = nonzero > 1  # [B] states where more than one action is available
-            priority_mask = (action_types == ActionType.PRIORITY.value) & is_players & decision_mask
-            opponent_priority_mask = (action_types == ActionType.PRIORITY.value) & (~is_players) & decision_mask
-            target_mask = (action_types == ActionType.CHOOSE_TARGET.value) & decision_mask
-            binary_mask = (action_types == ActionType.CHOOSE_USE.value) & decision_mask
+            priority_mask = (action_types == train.ActionType.PRIORITY.value) & is_players & decision_mask
+            opponent_priority_mask = (action_types == train.ActionType.PRIORITY.value) & (~is_players) & decision_mask
+            target_mask = (action_types == train.ActionType.CHOOSE_TARGET.value) & decision_mask
+            binary_mask = (action_types == train.ActionType.CHOOSE_USE.value) & decision_mask
+
 
             total_decision_examples += decision_mask.sum().item()
 
             # priority A
             if priority_mask.any():
-                log_probs_d = F.log_softmax(priority_logits[priority_mask][:, :PRIORITY_A_MAX], dim=1)
-                tgt = normalize_policy_labels(batch_policy_labels[priority_mask][:, :PRIORITY_A_MAX])
-                lpA = kld(log_probs_d, tgt)*lambda_pA
+                log_probs_d = F.log_softmax(priority_logits[priority_mask][:, :train.PRIORITY_A_MAX], dim=1)
+                tgt = train.normalize_policy_labels(batch_policy_labels[priority_mask][:, :train.PRIORITY_A_MAX])
+                lpA = kld(log_probs_d, tgt)*train.lambda_pA
                 s = log_probs_d.size(0)
                 total_pA_loss += lpA.item() * s
                 populate_matrix(pA_matrix, torch.argmax(tgt, dim=1), torch.argmax(log_probs_d, dim=1))
-
             else:
                 lpA = torch.zeros((), device=value_pred.device)
 
             # priority B (this uses virtual visits)
             if opponent_priority_mask.any():
-                log_probs_d = F.log_softmax(opponent_priority_logits[opponent_priority_mask][:, :PRIORITY_B_MAX], dim=1)
-                tgt = normalize_policy_labels(batch_policy_labels[opponent_priority_mask][:, :PRIORITY_B_MAX])
-                lpB = kld(log_probs_d, tgt)*lambda_pB
+                log_probs_d = F.log_softmax(opponent_priority_logits[opponent_priority_mask][:, :train.PRIORITY_B_MAX], dim=1)
+                tgt = train.normalize_policy_labels(batch_policy_labels[opponent_priority_mask][:, :train.PRIORITY_B_MAX])
+                lpB = kld(log_probs_d, tgt)*train.lambda_pB
                 s = log_probs_d.size(0)
                 total_pB_loss += lpB.item() * s
                 populate_matrix(pB_matrix, torch.argmax(tgt, dim=1), torch.argmax(log_probs_d, dim=1))
@@ -97,9 +107,9 @@ def validate(model, dl):
 
             # targets (shared between both players)
             if target_mask.any():
-                log_probs_d = F.log_softmax(target_logits[target_mask][:, :TARGETS_MAX], dim=1)
-                tgt = normalize_policy_labels(batch_policy_labels[target_mask][:, :TARGETS_MAX])
-                lt = kld(log_probs_d, tgt)*lambda_t
+                log_probs_d = F.log_softmax(target_logits[target_mask][:, :train.TARGETS_MAX], dim=1)
+                tgt = train.normalize_policy_labels(batch_policy_labels[target_mask][:, :train.TARGETS_MAX])
+                lt = kld(log_probs_d, tgt)*train.lambda_t
                 s = log_probs_d.size(0)
                 total_t_loss += lt.item() * s
                 populate_matrix(t_matrix, torch.argmax(tgt, dim=1), torch.argmax(log_probs_d, dim=1))
@@ -108,9 +118,9 @@ def validate(model, dl):
 
             # binary (choose to use) decisions
             if binary_mask.any():
-                log_probs_d = F.log_softmax(binary_logits[binary_mask][:, :BINARY_MAX], dim=1)
-                tgt = normalize_policy_labels(batch_policy_labels[binary_mask][:, :BINARY_MAX])
-                lb = kld(log_probs_d, tgt)*lambda_b
+                log_probs_d = F.log_softmax(binary_logits[binary_mask][:, :train.BINARY_MAX], dim=1)
+                tgt = train.normalize_policy_labels(batch_policy_labels[binary_mask][:, :train.BINARY_MAX])
+                lb = kld(log_probs_d, tgt)*train.lambda_b
                 s = log_probs_d.size(0)
                 total_b_loss += lb.item() * s
                 populate_matrix(b_matrix, torch.argmax(tgt, dim=1), torch.argmax(log_probs_d, dim=1))
@@ -164,19 +174,22 @@ def validate(model, dl):
             print("No choose_use samples in test set to calculate accuracy.")
 
 if __name__ == "__main__":
-    ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/testing")
-    with open(f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar", "rb") as f:
+
+
+    with open(f"models/{train.DECK_NAME}/ver{train.VER_NUMBER}/ignore.roar", "rb") as f:
         ignore = BitMap.deserialize(f.read())
     print(f"ignore list size: {len(ignore)}")
-    ds.ignore_list = ignore
 
-    dl = DataLoader(ds, batch_size=128, shuffle=False, num_workers=0, collate_fn=collate_batch,
-                    pin_memory=True, persistent_workers=False)
+    ds = H5Indexed(f"data/{train.DECK_NAME}/ver{train.VER_NUMBER}/testing", set(ignore))
 
-    model = Net(GLOBAL_MAX, ACTIONS_MAX).cuda()
+    if not train.TRAIN_OPPONENT_HEAD:
+        ds = filter_opponent_states(ds,train.TARGETS_MAX)
+
+    dl = DataLoader(ds, batch_size=128, shuffle=False, num_workers=0, collate_fn=collate_batch, pin_memory=True, persistent_workers=False)
+    model = train.Net(train.GLOBAL_MAX, train.ACTIONS_MAX).cuda()
     model.eval()
 
-    checkpoint_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt"  # Make sure this is the correct checkpoint
+    checkpoint_path = f"models/{train.DECK_NAME}/ver{train.VER_NUMBER}/model.pt"  # Make sure this is the correct checkpoint
     try:
         checkpoint = torch.load(checkpoint_path, map_location="cuda")
         model.load_state_dict(checkpoint['model_state_dict'])

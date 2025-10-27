@@ -1,5 +1,0 @@
-#XMAGE:
--make random seed deterministic and decoupled from mcts noise
--parallelize sims
--update base mapping between games
--decouple ignore list from features

@@ -12,17 +12,17 @@ This approach reframes the challenge of MTG AI from universal mastery to local o
 
 The core infrastructure for MageZero is complete and undergoing testing. The full end-to-end pipeline from simulation and data generation in Java to model training in PyTorch and back to inference via local python server is functional.
 
-If you are interested in contributing or running locally see the [setup guide]([url]https://github.com/WillWroble/MageZero/blob/main/setup_guide.md). I am also always available at <willwroble@gmail.com>
+If you are interested in contributing or running locally see the [setup guide](https://github.com/WillWroble/MageZero/blob/main/setup_guide.md). I am also always available at <willwroble@gmail.com>
 
 
-also see [FAQ and future goals]([url]https://github.com/WillWroble/MageZero/faq_goals.md)
+also see [FAQ and future goals](https://github.com/WillWroble/MageZero/faq_goals.md)
 
 ---
 
 ### 3. Self-Play Results (as of December 2025)
 
 Below is data from 2 long-running RL tests against a pool of 5 minimax (greedy AI) opponents playing mono colored decks.
-The decks chosen for RL ([UWTempo]([url]https://moxfield.com/decks/Bl76TS_q6E-HZ4G-s9_dlQ) and [Standard-MonoU]([url]https://moxfield.com/decks/Okxs-whgSkapj5kIXUgMPg)) were chosen deliberately for being extremely punishing for greedy AI. 
+The decks chosen for RL ([UWTempo](https://moxfield.com/decks/Bl76TS_q6E-HZ4G-s9_dlQ) and [Standard-MonoU](https://moxfield.com/decks/Okxs-whgSkapj5kIXUgMPg)) were chosen deliberately for being extremely punishing for greedy AI. 
 UWTempo's WR with minimax was 16%, with RL it reached 66%. for Standard-MonoU the minimax opponent pool contained itself, 
 so you can see in the graph below how much worse the minimax AI was in the mirror.
 

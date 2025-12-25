@@ -12,10 +12,10 @@ This approach reframes the challenge of MTG AI from universal mastery to local o
 
 The core infrastructure for MageZero is complete and undergoing testing. The full end-to-end pipeline from simulation and data generation in Java to model training in PyTorch and back to inference via local python server is functional.
 
-If you are interested in contributing or running locally see the [setup guide]([url]https://github.com/WillWroble/MageZero/setup_guide.md). I am also always available at <willwroble@gmail.com>
+If you are interested in contributing or running locally see the [setup guide]([url]https://github.com/WillWroble/MageZero/blob/main/setup_guide.md). I am also always available at <willwroble@gmail.com>
 
 
-also see [faq and future goals]([url]https://github.com/WillWroble/MageZero/faq_goals.md)
+also see [FAQ and future goals]([url]https://github.com/WillWroble/MageZero/faq_goals.md)
 
 ---
 

@@ -80,7 +80,7 @@ The model is a specialized Multi-Layer Perceptron (MLP) with a 2M dimension Embe
 
 * **Structure**: 
   * **Embedding Bag**: 2M dimensions; uses 'SUM' (so gradients scale with active feature count) with sparseAdam, and usually has ~200 active binary feature indices.
-  * **Embedding Layer** 512 dimensions; uses biases + batch norm with dropout layer (could theoretically be a shared embedding space for all states across all decks in MTG since input space is global)
+  * **Embedding Layer** 512 dimensions; uses layer norm with dropout layer (could theoretically be a shared embedding space for all states across all decks in MTG since input space is global)
   * **Hidden Layer** 256 dimensions; relu activation. (deck local embedding for policy + value)
   * **Policy Heads**: all deck local or matchup local
     * **Player Priority**: 128D; deck local; each logit corresponds to a priority action the Agent (PlayerA) can take (eg. activated abilities, casting spells). usually around ~20 logits are used per deck

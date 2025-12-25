@@ -112,7 +112,7 @@ y_N = z
 $$
 
 $$
-y_i = \lambda\, y_{i+1} + (1 - \lambda)\, h_i
+y_i = \lambda y_{i+1} + (1 - \lambda) h_i
 $$
 
 we also use a special blend for learning opponent playstyle when playing against other types of AI (eg minimax). We use the MCTS visits the agent had for the opponent at that node + K virtual visits for the observed action:

@@ -13,8 +13,8 @@ from dataset import H5Indexed, collate_batch,  create_redundancy_ignore_list, fi
 from pyroaring import BitMap
 
 #add training data under: data/{deck name}/ver{your version num}/training/{your data}.hdf5
-DECK_NAME = "UWTempo"
-VER_NUMBER = 8
+DECK_NAME = "Standard-MonoU"
+VER_NUMBER = 1
 
 MAKE_IGNORE_LIST = True
 TRAIN_OPPONENT_HEAD = False #turn off when training on round-robin data
@@ -25,10 +25,10 @@ USE_PREVIOUS_MODEL = True
 
 
 #TODO: wire into xmage data pipeline
-#for now just manually enter your matchup-specific action space sizes here for optimal normalization(in XMage run getActionsSpaces())
-PRIORITY_A_MAX = 29
-PRIORITY_B_MAX = 22
-TARGETS_MAX = 20 #for round-robin only go up to targets from own deck
+#for now just manually enter your matchup-specific action space sizes here for optimal normalization(XMage prints them at the start of each run)
+PRIORITY_A_MAX = 32
+PRIORITY_B_MAX = 32
+TARGETS_MAX = 32 #for round-robin only go up to targets from own deck
 BINARY_MAX = 2
 
 def head_weight(K: int) -> float:
@@ -69,7 +69,6 @@ class Net(nn.Module):
 
         embedding_dim = 512  # Output of EmbeddingBag
         hidden_dim_mlp = 256  # Output of the main MLP block
-
         self.embedding_bag = nn.EmbeddingBag(
             num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
@@ -77,8 +76,8 @@ class Net(nn.Module):
             sparse=True
             #,max_norm=1
         )
-        # 1. Define the learnable bias parameter
         self.embedding_bias = nn.Parameter(torch.zeros(embedding_dim))
+        self.input_dropout = 0
         self.embedding_norm = nn.LayerNorm(embedding_dim)
         self.embedding_dropout = nn.Dropout(p=0.5)
         self.l1_penalty = None
@@ -99,7 +98,13 @@ class Net(nn.Module):
         )
 
     def forward(self, indices, offsets):
-        emb = self.embedding_bag(indices, offsets)
+        input_weights = None
+        if self.training and self.input_dropout > 0:
+            keep_mask = torch.rand_like(indices, dtype=torch.float32) > self.input_dropout
+            keep_mask = keep_mask.to(torch.float32)
+            input_weights = keep_mask / (1.0 - self.input_dropout)
+
+        emb = self.embedding_bag(indices, offsets, per_sample_weights=input_weights)
 
         if self.training:
             self.l1_penalty = emb.abs().sum() * 1e-7
@@ -140,10 +145,10 @@ def train():
             with open(f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar", "rb") as f:
                 ignore_list2 = BitMap.deserialize(f.read())
                 ignore_list.intersection_update(ignore_list2)
+                #ignore_list = ignore_list2
             print(f"intersected with previous ignore list: {len(ignore_list2)} for final ignore list: {len(ignore_list)} leaving {GLOBAL_MAX-len(ignore_list)} features")
             # opt_sparse.load_state_dict(checkpoint['optimizer_sparse_state_dict'])
             # opt_dense.load_state_dict(checkpoint['optimizer_dense_state_dict'])
-            # start_epoch = checkpoint['epoch'] + 1 # Use this if you want to continue the same run
             print(f"Successfully loaded checkpoint from {checkpoint_path}")
         except FileNotFoundError:
             print(f"INFO: Checkpoint file not found at {checkpoint_path}. Starting from scratch.")
@@ -280,7 +285,6 @@ def train():
             total_l1_dense_loss += l1_dense.item()
             total_l1_sparse_loss += model.l1_penalty.item()
             loss = lpA + lpB + lt + lb + lv #+ model.l1_penalty #+ l1_dense
-
             opt_sparse.zero_grad()
             opt_dense.zero_grad()
             loss.backward()

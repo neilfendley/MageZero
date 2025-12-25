@@ -248,7 +248,7 @@ def filter_opponent_states(dataset, targets_max):
 if __name__ == "__main__":
 
     # Define the directory where you save your game data files.
-    data_directory = "data/UWTempo/ver1/testing"
+    data_directory = "data/MTGA_MonoU/ver1/testing"
 
     try:
         # Load dataset from the specified folder

@@ -12,7 +12,7 @@ from train import DECK_NAME, VER_NUMBER, GLOBAL_MAX,ActionType, PRIORITY_A_MAX, 
 
 
 
-SPLIT = "training"          # "training" or "testing"
+SPLIT = "testing"          # "training" or "testing"
 OUT_DIR = "stats_out"       # where to save figures
 SHOW_PLOTS = True           # headless? set False
 SAVE_PLOTS = True           # save PNGs to OUT_DIR

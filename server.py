@@ -1,151 +1,184 @@
 import os
-import sys
-from pathlib import Path
-from typing import List, Optional
+import threading
+import time
+from queue import Queue, Empty
 
 import torch
 from pyroaring import BitMap
 from flask import Flask, request, Response
 import msgpack
-import threading, time
-from queue import Queue, Empty
 
 from train import Net, GLOBAL_MAX, ACTIONS_MAX, VER_NUMBER, DECK_NAME
+
 MODEL_DIR = f"models/{DECK_NAME}/ver{VER_NUMBER}"
 IGNORE = MODEL_DIR + "/ignore.roar"
 MODEL = MODEL_DIR + "/model.pt"
 
-# Model + ignore list setup
+# Device setup
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load ignore bitmap (created during training)
+# Load ignore bitmap
 with open(IGNORE, "rb") as f:
     IGNORE_BM = BitMap.deserialize(f.read())
 
-# Load model checkpoint (policy logits + value)  # :contentReference[oaicite:3]{index=3}
+# Valid range bitmap for bounds checking (roaring compresses this to ~bytes)
+VALID_RANGE = BitMap(range(GLOBAL_MAX))
+
+# Load model
 server_model = Net(GLOBAL_MAX, ACTIONS_MAX).to(DEVICE).eval()
 ckpt = torch.load(MODEL, map_location=DEVICE)
 server_model.load_state_dict(ckpt["model_state_dict"])
 
-# Optional CPU threading tuning
+# Threading config
 TORCH_THREADS = max(1, os.cpu_count() // 2)
 torch.set_num_threads(TORCH_THREADS)
 
-app = Flask(__name__)
+# Batching config
+MAX_BATCH = 2
+MAX_WAIT_MS = 0
 
+app = Flask(__name__)
 
 req_counter = 0
 req_counter_lock = threading.Lock()
 
+
 class Pending:
     __slots__ = ("idx", "off", "evt", "out", "req_id", "pre_count", "post_count", "t_recv", "t_done", "num_bags")
+
     def __init__(self, req_id, indices, offsets):
-        # Apply ignore filter server-side (same as test/train do before batching)  # :contentReference[oaicite:4]{index=4}
         self.req_id = req_id
         self.pre_count = len(indices)
-        indices, offsets, num_bags = apply_ignore(indices, offsets, GLOBAL_MAX, IGNORE_BM)
-        self.post_count = len(indices)
-        self.num_bags = num_bags
-
-        # Only now construct tensors (avoid surfacing earlier CUDA errors here)
-        self.idx = torch.tensor(indices, dtype=torch.long)  # CPU
-        self.off = torch.tensor(offsets, dtype=torch.long)  # CPU
-
         self.t_recv = time.perf_counter()
         self.evt = threading.Event()
         self.out = None
         self.t_done = 0.0
 
-Q: "Queue[Pending]" = Queue(maxsize=4096)
-def apply_ignore(indices: list[int], offsets: list[int] | None, global_max: int, ignore_bm: BitMap):
+        indices, offsets, num_bags = apply_ignore(indices, offsets)
+        self.post_count = len(indices)
+        self.num_bags = num_bags
+
+        self.idx = torch.tensor(indices, dtype=torch.long)
+        self.off = torch.tensor(offsets, dtype=torch.long)
+
+
+def apply_ignore(indices: list[int], offsets: list[int] | None):
     if not offsets:
         offsets = [0]
 
-    if offsets[0] != 0:
-        offsets[0] = 0
-    if any(o < 0 for o in offsets):
-        raise ValueError("offsets contain negative values")
-    if any(offsets[i] > offsets[i+1] for i in range(len(offsets)-1)):
-        raise ValueError("offsets not non-decreasing")
-
     if len(offsets) == 1:
-        # filter + bounds check
-        filt = [i for i in indices if (i in ignore_bm) is False and 0 <= i < global_max]
-        return filt, [0], 1
+        # Single bag - pure bitmap ops in C
+        kept_bm = (BitMap(indices) - IGNORE_BM) & VALID_RANGE
+        return list(kept_bm), [0], 1
 
+    # Multi-bag
+    n = len(indices)
     new_indices = []
     new_offsets = [0]
-    n = len(indices)
+
     for b in range(len(offsets)):
         start = offsets[b]
-        end = offsets[b+1] if b+1 < len(offsets) else n
-        if not (0 <= start <= end <= n):
-            raise ValueError(f"bad bag bounds: {start}..{end} within 0..{n}")
-        bag = indices[start:end]
-        bag = [i for i in bag if (i in ignore_bm) is False and 0 <= i < global_max]
-        new_indices.extend(bag)
-        new_offsets.append(len(new_indices))
-    new_offsets = new_offsets[:-1]
+        end = offsets[b + 1] if b + 1 < len(offsets) else n
 
+        kept_bm = (BitMap(indices[start:end]) - IGNORE_BM) & VALID_RANGE
+        new_indices.extend(kept_bm)
+        new_offsets.append(len(new_indices))
+
+    new_offsets = new_offsets[:-1]
     return new_indices, new_offsets, len(new_offsets)
+
+
+Q: "Queue[Pending]" = Queue(maxsize=4096)
+
 
 def worker_loop():
     print(f"[INIT] Device={DEVICE}, torch threads={TORCH_THREADS}, "
-        f"model={MODEL}, ignore={IGNORE}")
+          f"model={MODEL}, ignore={IGNORE}")
+
     while True:
         p0 = Q.get()
         batch = [p0]
-        t0 = time.time()
 
+        # Collect more requests up to MAX_BATCH or MAX_WAIT_MS
+        deadline = time.perf_counter() + (MAX_WAIT_MS / 1000.0)
+        while len(batch) < MAX_BATCH or not Q.empty():
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                remaining = 0
+                if Q.empty():
+                    break
+            try:
+                batch.append(Q.get(timeout=remaining))
+            except Empty:
+                break
 
-        p = batch[0]
-        with torch.no_grad():
-            idx = p.idx.to(DEVICE, non_blocking=True)
-            off = p.off.to(DEVICE, non_blocking=True)
-            pA, pB, tgt, bin2, val = server_model(idx, off)  # shapes: [B,A], [B,A], [B,A], [B,2], [B]
+        bag_counts = [p.num_bags for p in batch]
 
-        # move to CPU
-        pA = pA.detach().to("cpu")
-        pB = pB.detach().to("cpu")
-        tgt = tgt.detach().to("cpu")
-        bin2 = bin2.detach().to("cpu")
-        val = val.detach().to("cpu")
-
-        if p.num_bags == 1:
-            p.out = {
-                "policy_player": pA[0].tolist(),
-                "policy_opponent": pB[0].tolist(),
-                "policy_target": tgt[0].tolist(),
-                "policy_binary": bin2[0].tolist(),
-                "value": float(val[0].item()),
-            }
+        # Fast path: single request
+        if len(batch) == 1:
+            idx = batch[0].idx.to(DEVICE, non_blocking=True)
+            off = batch[0].off.to(DEVICE, non_blocking=True)
         else:
-            # Multi-bag in a single HTTP request -> array of maps
-            B = p.num_bags
-            p.out = [
-                {
-                    "policy_player": pA[i].tolist(),
-                    "policy_opponent": pB[i].tolist(),
-                    "policy_target": tgt[i].tolist(),
-                    "policy_binary": bin2[i].tolist(),
-                    "value": float(val[i].item()),
-                }
-                for i in range(B)
-            ]
+            # Concatenate indices
+            idx = torch.cat([p.idx for p in batch]).to(DEVICE, non_blocking=True)
 
-        p.t_done = time.perf_counter()
-        p.evt.set()
+            # Vectorized offset adjustment
+            all_off = torch.cat([p.off for p in batch])
+            idx_lens = torch.tensor([len(p.idx) for p in batch])
+            bag_counts_t = torch.tensor(bag_counts)
+            adjustments = torch.repeat_interleave(
+                torch.cat([torch.tensor([0]), idx_lens.cumsum(0)[:-1]]),
+                bag_counts_t
+            )
+            off = (all_off + adjustments).to(DEVICE, non_blocking=True)
+
+        # Single forward pass
+        with torch.no_grad():
+            pA, pB, tgt, bin2, val = server_model(idx, off)
+
+        # Move to CPU once
+        pA = pA.cpu()
+        pB = pB.cpu()
+        tgt = tgt.cpu()
+        bin2 = bin2.cpu()
+        val = val.cpu()
+
+        # Split results back to individual requests
+        row = 0
+        for p, num_bags in zip(batch, bag_counts):
+            if num_bags == 1:
+                p.out = {
+                    "policy_player": pA[row].tolist(),
+                    "policy_opponent": pB[row].tolist(),
+                    "policy_target": tgt[row].tolist(),
+                    "policy_binary": bin2[row].tolist(),
+                    "value": float(val[row].item()),
+                }
+            else:
+                p.out = [
+                    {
+                        "policy_player": pA[row + i].tolist(),
+                        "policy_opponent": pB[row + i].tolist(),
+                        "policy_target": tgt[row + i].tolist(),
+                        "policy_binary": bin2[row + i].tolist(),
+                        "value": float(val[row + i].item()),
+                    }
+                    for i in range(num_bags)
+                ]
+            row += num_bags
+            p.t_done = time.perf_counter()
+            p.evt.set()
+
+        print(f"[BATCH] size={len(batch)}, total_bags={row}")
 
 
 threading.Thread(target=worker_loop, daemon=True).start()
 
+
 @app.post("/evaluate")
 def evaluate():
     global req_counter
-    """
-    MessagePack request: {"indices": [int64], "offsets": [int64]}  (offsets optional → defaults to [0])
-    Returns MessagePack: {"policy": [float], "value": float}
-    """
+
     data = msgpack.unpackb(request.data, raw=False)
     with req_counter_lock:
         req_counter += 1
@@ -153,24 +186,22 @@ def evaluate():
     indices = data.get("indices", [])
     offsets = data.get("offsets", [])
     pending = Pending(req_counter, indices, offsets)
-    # Per-request log (received)
-    print(f"[REQ {pending.req_id}] num_indices={pending.post_count}, num_ignored={pending.pre_count - pending.post_count}, batch_num={len(pending.off)} indices={pending.pre_count}")
+
+    print(f"[REQ {pending.req_id}] indices={pending.pre_count}, kept={pending.post_count}, bags={pending.num_bags}")
 
     Q.put(pending)
     pending.evt.wait()
 
-    # Per-request log (done)
     total_ms = (pending.t_done - pending.t_recv) * 1000.0
-    print(f"[REQ {pending.req_id}] done: total_ms={total_ms:.3f}")
+    print(f"[REQ {pending.req_id}] done: {total_ms:.1f}ms")
 
-    payload = msgpack.packb(pending.out, use_bin_type=True)
-    return Response(payload, mimetype="application/x-msgpack")
+    return Response(msgpack.packb(pending.out, use_bin_type=True), mimetype="application/x-msgpack")
+
 
 @app.get("/healthz")
 def healthz():
     return "ok", 200
 
+
 if __name__ == "__main__":
-    # Dev run; for production use gunicorn:
-    #gunicorn server:app --bind 127.0.0.1:50052 --workers 1 --threads 8 --keep-alive 120 --timeout 0
     app.run(host="127.0.0.1", port=50052, threaded=True)

@@ -58,6 +58,7 @@ def validate(model, dl):
     pB_matrix = torch.zeros(train.PRIORITY_B_MAX, train.PRIORITY_B_MAX, dtype=torch.long)
     t_matrix = torch.zeros(train.TARGETS_MAX, train.TARGETS_MAX, dtype=torch.long)
     b_matrix = torch.zeros(train.BINARY_MAX, train.BINARY_MAX, dtype=torch.long)
+    #model = train.Net(train.GLOBAL_MAX, train.ACTIONS_MAX).cuda()
     model.eval()
     with torch.no_grad():
         for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in dl:

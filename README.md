@@ -15,7 +15,7 @@ The core infrastructure for MageZero is complete and undergoing testing. The ful
 If you are interested in contributing or running locally see the [setup guide](https://github.com/WillWroble/MageZero/blob/main/setup_guide.md). I am also always available at <willwroble@gmail.com>
 
 
-also see [FAQ and future goals](https://github.com/WillWroble/MageZero/faq_goals.md)
+also see [FAQ and future goals](https://github.com/WillWroble/MageZero/blob/main/faq_goals.md)
 
 ---
 

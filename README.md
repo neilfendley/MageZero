@@ -10,6 +10,8 @@ This approach reframes the challenge of MTG AI from universal mastery to local o
 
 ### 2. Current Status (December 2025): **Learning-MCTS agent implemented in Parallel AIvsAI environment in XMage**
 
+This project uses [XMage](https://github.com/magefree/mage), an Open Source complete MTG rules engine as a gym environment. See this project's [XMage fork](https://github.com/WillWroble/mage) for the State vectorization and MCTS logic. (relevant modules: `Player.AI.RL`, `Player.AI.MCTS`, `Tests/src/java/org.mage.test/AI/RL`)
+
 The core infrastructure for MageZero is complete and undergoing testing. The full end-to-end pipeline from simulation and data generation in Java to model training in PyTorch and back to inference via local python server is functional.
 
 If you are interested in contributing or running locally see the [setup guide](https://github.com/WillWroble/MageZero/blob/main/setup_guide.md). I am also always available at <willwroble@gmail.com>

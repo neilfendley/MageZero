@@ -71,7 +71,7 @@ MageZero's architecture is an end-to-end self-improvement cycle.
 
 #### **Game Engine & Feature Encoding**
 
-MageZero is implemented atop XMage, an open-source MTG simulator. Game state is captured via a custom `StateEncoder.java`, which converts each decision point into a high-dimensional binary feature vector.
+Within the XMage fork, Game state is captured via a custom `StateEncoder.java`, which converts each decision point into a high-dimensional binary feature vector.
 
 * **Dynamic Feature Hashing**: This system supports a sparse, open-ended state representation to handle all the discrete artifacts and tokens MTG games can produce. This is done by use of a massive sparse Embedding Bag (2M features) with Weinberger style feature hashing. A typical 60card deck matchup utilizes a \~5,000 feature slice of this space. With usually around ~200 active features per state (after filtering redundant features) making chance of collision <0.01%. Since all decks share the same massive input space, overlapping deck feature slices allow for potential cross-deck learning.
 * **Hierarchical & Abstracted Features**: The hashing captures not just card presence but also sub-features (like abilities on a card) and game metadata (life totals, turn phase). Numeric features are discretized, and cardinality is represented through thresholds. Sub-features pool up to parent features, creating additional layers of abstraction (e.g., a "green" sub-feature on a creature contributes to a "green permanents on the battlefield" count), providing a richer, more redundant signal for the model.
@@ -88,9 +88,9 @@ The model is a specialized Multi-Layer Perceptron (MLP) with a 2M dimension Embe
     * **Player Priority**: 128D; deck local; each logit corresponds to a priority action the Agent (PlayerA) can take (eg. activated abilities, casting spells). usually around ~20 logits are used per deck
     * **Opponent Priority**: 128D; opponent deck local; each logit corresponds to a priority action the opponent (PlayerB could take). when running MCTS vs MCTS games. both Agents share one network. and use each head.
     * **Targets**: 128D; matchup local; shared target space across both decks for all micro decisions involving targets. (this is used for selecting which attacking creature to use a blocker on). usually ~60 logits used per matchup
-    * **Binary decisions** 2D: matchup local; shared binary space for all binary decisions made by either player. (this is used to select blockers and attackers sequentially)
-  * **Value Head**: Estimates the probability of winning (trained with Mean Squared Error). The target blends the MCTS root score (as in MuZero) with a discounted terminal reward.
-* **Optimization**: The network uses a combination of Adam and SparseAdam optimizers. Training incorporates dropout layers (p=0.3) for regularization.
+    * **Binary decisions** 2D: matchup local; shared binary space for all binary decisions made by either player. (this is used to select attackers sequentially)
+  * **Value Head**: Estimates the probability of winning (trained with Mean Squared Error). The value target uses a MuZero style TD-blend over MCTS roots scores for richer, more stable value predictions.
+* **Optimization**: The network uses a combination of Adam and SparseAdam optimizers. Training incorporates dropout layers (p=0.5) for regularization.
 * **Training**: all training samples are flagged with their decision type (player priority, opponent priority, target decision, binary decision). all sample types are trained together in mixed batches but policy gradients are gated to each sample's corresponding policy head. 
 
 
@@ -105,7 +105,7 @@ we use c = 1.0. but otherwise keep the formula the same. however there were many
 
 For one, unlike Chess, MTG has many different type of decision points. (priority, choosing targets, ordering triggers, attacking etc.) This is why we use a special policy head for each one, since all of these decisions can be game swinging and are highly learnable.
 
-We also don't use and Dirichlet noise or temp sampling like the original AlphaZero authors did. Instead, we found we were able to get stable network progression by increasing search depth since MTG already has a lot of inherent randomness. 
+We also don't use and Dirichlet noise or temperature sampling like the original AlphaZero authors did. Instead, we found we were able to get stable network progression by increasing search depth since MTG already has a lot of inherent randomness. 
 
 Another key difference was using a TD-style discounting blend between intermediate MCTS root scores, and the next value target. This is much more stable than terminal only and stays bounded for MCTS. ($0.9 \leq \lambda \leq 0.95$ )
 

@@ -14,15 +14,15 @@ from dataset import H5Indexed, collate_batch,  create_redundancy_ignore_list, fi
 from pyroaring import BitMap
 
 #add training data under: data/{deck name}/ver{your version num}/training/{your data}.hdf5
-DECK_NAME = "Standard-MonoU"
+DECK_NAME = "Standard-MonoB"
 VER_NUMBER = 1
 
 MAKE_IGNORE_LIST = True
 TRAIN_OPPONENT_HEAD = False #turn off when training on round-robin data
 ACTIONS_MAX = 128
 GLOBAL_MAX = 2000000
-EPOCH_COUNT = 10
-USE_PREVIOUS_MODEL = True
+EPOCH_COUNT = 60
+USE_PREVIOUS_MODEL = False
 
 
 #TODO: wire into xmage data pipeline
@@ -50,7 +50,9 @@ lambda_b = head_weight(BINARY_MAX)
 def load_model(path):
     if path.endswith('.gz'):
         with gzip.open(path, 'rb') as f:
-            return torch.load(f)
+            out = torch.load(f, map_location=torch.device('cpu'))
+            return out
+
     return torch.load(path)
 
 
@@ -134,6 +136,7 @@ def normalize_policy_labels(raw: torch.Tensor) -> torch.Tensor:
 def train():
     os.makedirs(f"models/{DECK_NAME}/ver{VER_NUMBER}", exist_ok=True)
     ds_raw = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training")
+    print(torch.cuda.is_available())
 
 
     #ignore handling

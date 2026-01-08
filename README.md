@@ -14,6 +14,8 @@ This project uses [XMage](https://github.com/magefree/mage), an Open Source comp
 
 The core infrastructure for MageZero is complete and undergoing testing. The full end-to-end pipeline from simulation and data generation in Java to model training in PyTorch and back to inference via local python server is functional.
 
+The first alpha release (with precompiled XMage module) is planned for early February.
+
 If you are interested in contributing or running locally see the [setup guide](https://github.com/WillWroble/MageZero/blob/main/setup_guide.md). I am also always available at <willwroble@gmail.com>
 
 

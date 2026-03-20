@@ -9,13 +9,13 @@ import math
 import gzip
 
 
-import test
-from dataset import H5Indexed, collate_batch,  create_redundancy_ignore_list, filter_opponent_states
+import magezero.test as test
+from magezero.dataset import H5Indexed, collate_batch,  create_redundancy_ignore_list, filter_opponent_states
 from pyroaring import BitMap
 
 #add training data under: data/{deck name}/ver{your version num}/training/{your data}.hdf5
-DECK_NAME = "Standard-MonoB"
-VER_NUMBER = 1
+DECK_NAME = "BWBats"
+VER_NUMBER = 0
 
 MAKE_IGNORE_LIST = True
 TRAIN_OPPONENT_HEAD = False #turn off when training on round-robin data

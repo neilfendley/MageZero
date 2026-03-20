@@ -4,8 +4,8 @@ from pyroaring import BitMap
 from torch import nn  # optim is not strictly needed for testing if not optimizing
 from torch.utils.data import DataLoader
 
-from dataset import H5Indexed, collate_batch, filter_opponent_states
-import train
+from magezero.dataset import H5Indexed, collate_batch, filter_opponent_states
+# import magezero.train
 
 SHOW_CONFUSION_MATRIX = True
 

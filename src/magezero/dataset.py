@@ -27,9 +27,9 @@ class H5Indexed(Dataset):
 
     def __init__(self, dir_path: str, ignore: set[int] | None = None):
         p = Path(dir_path)
-        h5_paths = sorted(list(p.glob("*.h5")) + list(p.glob("*.hdf5")))
+        h5_paths = sorted(list(p.glob("**/*.h5")) + list(p.glob("**/*.hdf5")))
         self.files = [str(pp) for pp in h5_paths]
-
+        breakpoint()
         if not self.files:
             self.N = 0
             self.A = 0
@@ -50,7 +50,7 @@ class H5Indexed(Dataset):
                 off = f["/offsets"][...].astype(np.int64, copy=False)  # [N+1]
                 idx = f["/indices"][...].astype(np.int32, copy=False)  # [nnz]
                 row = f["/row"][...].astype(np.float32, copy=False)  # [N, A+4]
-                N = int(off.shape[0] - 1);
+                N = int(off.shape[0] - 1)
                 nnz = int(off[-1])
                 A_local = int(row.shape[1] - 4)
                 if A_ref is None:
@@ -64,7 +64,7 @@ class H5Indexed(Dataset):
                 nnz_cum += nnz
                 N_total += N
 
-        self.N = N_total;
+        self.N = N_total
         self.A = A_ref if A_ref is not None else 0
         idxptr_np = np.asarray(idxptr, dtype=np.int64)  # [N+1]
         indices_np = (np.concatenate(indices_chunks) if indices_chunks

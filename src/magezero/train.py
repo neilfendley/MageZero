@@ -14,7 +14,7 @@ from magezero.dataset import H5Indexed, collate_batch,  create_redundancy_ignore
 from pyroaring import BitMap
 
 #add training data under: data/{deck name}/ver{your version num}/training/{your data}.hdf5
-DECK_NAME = "BWBats"
+DECK_NAME = "IzzetElementals"
 VER_NUMBER = 0
 
 MAKE_IGNORE_LIST = True

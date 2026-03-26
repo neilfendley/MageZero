@@ -29,7 +29,6 @@ class H5Indexed(Dataset):
         p = Path(dir_path)
         h5_paths = sorted(list(p.glob("**/*.h5")) + list(p.glob("**/*.hdf5")))
         self.files = [str(pp) for pp in h5_paths]
-        breakpoint()
         if not self.files:
             self.N = 0
             self.A = 0

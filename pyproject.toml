@@ -28,3 +28,4 @@ build-backend = "setuptools.build_meta"
 [project.scripts]
 train = "magezero.train:train"
 explore = "magezero.game_exploration:explore_game"
+selfplay = "magezero.selfplay_loop:main"

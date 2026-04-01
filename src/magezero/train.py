@@ -13,24 +13,40 @@ import magezero.test as test
 from magezero.dataset import H5Indexed, collate_batch,  create_redundancy_ignore_list, filter_opponent_states
 from pyroaring import BitMap
 
-#add training data under: data/{deck name}/ver{your version num}/training/{your data}.hdf5
-DECK_NAME = "IzzetElementals"
-VER_NUMBER = 0
+def env_str(name: str, default: str) -> str:
+    return os.environ.get(name, default)
 
-MAKE_IGNORE_LIST = True
-TRAIN_OPPONENT_HEAD = False #turn off when training on round-robin data
-ACTIONS_MAX = 128
-GLOBAL_MAX = 2000000
-EPOCH_COUNT = 60
-USE_PREVIOUS_MODEL = False
+
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return int(value) if value is not None else default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+#add training data under: data/{deck name}/ver{your version num}/training/{your data}.hdf5
+DECK_NAME = env_str("MAGEZERO_DECK_NAME", "IzzetElementals")
+VER_NUMBER = env_int("MAGEZERO_VER_NUMBER", 0)
+
+MAKE_IGNORE_LIST = env_bool("MAGEZERO_MAKE_IGNORE_LIST", True)
+TRAIN_OPPONENT_HEAD = env_bool("MAGEZERO_TRAIN_OPPONENT_HEAD", False) #turn off when training on round-robin data
+ACTIONS_MAX = env_int("MAGEZERO_ACTIONS_MAX", 128)
+GLOBAL_MAX = env_int("MAGEZERO_GLOBAL_MAX", 2000000)
+EPOCH_COUNT = env_int("MAGEZERO_EPOCH_COUNT", 60)
+USE_PREVIOUS_MODEL = env_bool("MAGEZERO_USE_PREVIOUS_MODEL", False)
 
 
 #TODO: wire into xmage data pipeline
 #for now just manually enter your matchup-specific action space sizes here for optimal normalization(XMage prints them at the start of each run)
-PRIORITY_A_MAX = 128
-PRIORITY_B_MAX = 128
-TARGETS_MAX = 128
-BINARY_MAX = 2
+PRIORITY_A_MAX = env_int("MAGEZERO_PRIORITY_A_MAX", 128)
+PRIORITY_B_MAX = env_int("MAGEZERO_PRIORITY_B_MAX", 128)
+TARGETS_MAX = env_int("MAGEZERO_TARGETS_MAX", 128)
+BINARY_MAX = env_int("MAGEZERO_BINARY_MAX", 2)
 
 def head_weight(K: int) -> float:
     """

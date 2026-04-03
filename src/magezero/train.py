@@ -41,9 +41,10 @@ ACTIONS_MAX = env_int("MAGEZERO_ACTIONS_MAX", 128)
 GLOBAL_MAX = env_int("MAGEZERO_GLOBAL_MAX", 2000000)
 EPOCH_COUNT = env_int("MAGEZERO_EPOCH_COUNT", 60)
 USE_PREVIOUS_MODEL = env_bool("MAGEZERO_USE_PREVIOUS_MODEL", False)
+USE_IGNORE = env_bool("MAGEZERO_USE_IGNORE", True)
 BATCH_SIZE = env_int("MAGEZERO_BATCH_SIZE", 128)
-EMBEDDING_DIM = env_int("MAGEZERO_EMBEDDING_DIM", 284)
-HIDDEN_DIM = env_int("MAGEZERO_HIDDEN_DIM", 142)
+EMBEDDING_DIM = env_int("MAGEZERO_EMBEDDING_DIM", 432)
+HIDDEN_DIM = env_int("MAGEZERO_HIDDEN_DIM", 216)
 USE_MIXED_PRECISION = env_bool("MAGEZERO_MIXED_PRECISION", True)
 
 
@@ -200,7 +201,9 @@ def train():
     print(torch.cuda.is_available())
 
     ##Ignore handling
+    # if USE_IGNORE:
     ignore_list_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar"
+    print(DECK_NAME, VER_NUMBER, ignore_list_path)
     if os.path.exists(ignore_list_path):
         print("Loading existing ignore list from ignore.roar")
         with open(ignore_list_path, "rb") as f:
@@ -208,7 +211,7 @@ def train():
         ignore_list = list(loaded_bitmap)
     else:
         print("Generating ignore list from dataset to use for model")
-        ignore_list = create_redundancy_ignore_list(ds_raw)
+        ignore_list = create_redundancy_ignore_list(ds_raw, k=1)
         if not MAKE_IGNORE_LIST: ignore_list = []
         print("Saving ignore list to ignore.roar")
 
@@ -228,7 +231,7 @@ def train():
 
     # optional start point
     if USE_PREVIOUS_MODEL:
-        checkpoint_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt.gz"
+        checkpoint_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt"
         try:
             #checkpoint = torch.load(checkpoint_path, map_location="cuda")
             checkpoint = load_model(checkpoint_path)
@@ -237,7 +240,7 @@ def train():
                 ignore_list2 = BitMap.deserialize(f.read())
                 ignore_list.intersection_update(ignore_list2)
                 #ignore_list = ignore_list2
-            print(f"intersected with previous ignore list: {len(ignore_list2)} for final ignore list: {len(ignore_list)} leaving {actual_embeddings_needed-len(ignore_list)} features")
+            # print(f"intersected with previous ignore list: {len(ignore_list2)} for final ignore list: {len(ignore_list)} leaving {actual_embeddings_needed-len(ignore_list)} features")
             # opt_sparse.load_state_dict(checkpoint['optimizer_sparse_state_dict'])
             # opt_dense.load_state_dict(checkpoint['optimizer_dense_state_dict'])
             print(f"Successfully loaded checkpoint from {checkpoint_path}")
@@ -253,9 +256,9 @@ def train():
     test_ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/testing", ignore_list)
 
     #if round-robin filter out opponent states AFTER making the ignore list
-    # if not TRAIN_OPPONENT_HEAD:
-    #     ds = filter_opponent_states(ds,TARGETS_MAX)
-    #     test_ds = filter_opponent_states(test_ds,TARGETS_MAX)
+    if not TRAIN_OPPONENT_HEAD:
+        ds = filter_opponent_states(ds,TARGETS_MAX)
+        test_ds = filter_opponent_states(test_ds,TARGETS_MAX)
 
 
 
@@ -398,16 +401,16 @@ def train():
             test.validate(model, dl_test)
         #TODO: make validation based checkpoint schedule
         if epoch == EPOCH_COUNT:
-            checkpoint_save_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt.gz"
-            with open(checkpoint_save_path, 'wb') as f:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_sparse_state_dict': opt_sparse.state_dict(),
-                    'optimizer_dense_state_dict': opt_dense.state_dict(),
-                    'avg_p_loss': avg_pA_loss,  # Optional: save last losses
-                    'avg_v_loss': avg_v_loss,
-                }, f)
+            checkpoint_save_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt"
+            # with open(checkpoint_save_path, 'wb') as f:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_sparse_state_dict': opt_sparse.state_dict(),
+                'optimizer_dense_state_dict': opt_dense.state_dict(),
+                'avg_p_loss': avg_pA_loss,  # Optional: save last losses
+                'avg_v_loss': avg_v_loss,
+            }, checkpoint_save_path)
 
 if __name__ == "__main__":
     train()

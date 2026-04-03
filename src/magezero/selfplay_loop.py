@@ -71,7 +71,8 @@ def post(url: str) -> None:
 
 def run_command(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
     print(f"[cmd] {' '.join(cmd)}", flush=True)
-    subprocess.run(cmd, cwd=cwd, env=env, check=True)
+    print(f"[cmd] cwd={cwd}", flush=True)
+    subprocess.run(cmd, cwd=cwd, check=True, shell=True, env=env)
 
 
 def start_server(args: argparse.Namespace, env: dict[str, str]) -> subprocess.Popen:
@@ -107,8 +108,8 @@ def build_krenko_command(args: argparse.Namespace) -> list[str]:
         "mvn",
         "-pl",
         "Mage.Tests",
-        "-am",
-        "test-compile",
+        # "-am",
+        # "test-compile",
         "exec:java",
         "-Dexec.classpathScope=test",
         "-Dexec.mainClass=org.mage.test.AI.KrenkoMain",
@@ -155,7 +156,7 @@ def main() -> None:
 
     server = start_server(args, base_env)
     try:
-        wait_for_http(f"http://{args.server_host}:{args.server_port}/healthz", timeout_s=360)
+        wait_for_http(f"http://{args.server_host}:{args.server_port}/healthz", timeout_s=60)
         print("[server] ready", flush=True)
 
         for iteration in range(1, args.iterations + 1):

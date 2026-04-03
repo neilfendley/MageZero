@@ -147,50 +147,44 @@ def collate_batch(batch):
 def create_redundancy_ignore_list(ds, k=10) -> Set[int]:
     """
     constructs a data derived ignore list which includes perfectly redundant features, and features that occur less than k times.
+    RAM-optimized version that avoids building full sparse matrix.
     """
-    # make sparse matrix
-    rows_list, cols_list = [], []
-
+    # stream feature occurrences without building full matrix
+    # maps: feature_idx -> set of sample indices that contain it
+    feature_to_samples = {}
     num_samples = 0
 
+    # single pass: collect which samples contain each feature
     for (idxs, _, _, _, _) in ds:
         idxs_np = idxs.cpu().numpy().astype(np.int32, copy=False)
-        rows_list.append(np.full(idxs_np.shape, num_samples, dtype=np.int32))
-        cols_list.append(idxs_np)
+        for feature_idx in idxs_np:
+            feature_idx_int = int(feature_idx)
+            if feature_idx_int not in feature_to_samples:
+                feature_to_samples[feature_idx_int] = set()
+            feature_to_samples[feature_idx_int].add(num_samples)
         num_samples += 1
 
-    rows = np.concatenate(rows_list)
-    cols = np.concatenate(cols_list)
-
-    data = np.ones_like(cols, dtype=np.uint8)
-
-    x_csc = coo_matrix(
-        (data, (rows, cols)),
-        shape=(num_samples, GLOBAL_MAX),
-        dtype=np.uint8
-    ).tocsc()
-
-    # group identical columns
-    groups = {}
-    indptr = x_csc.indptr
-    idxs = x_csc.indices
-
+    # identify features to ignore
     ignore = set()
 
-    for j in range(GLOBAL_MAX):
-        start, end = indptr[j], indptr[j + 1]
-        key = tuple(idxs[start:end])  # () means unseen/empty
-        if len(key) <= k:
-            ignore.add(j)
-        groups.setdefault(key, []).append(j)
+    # 1. features that occur less than k times
+    for feature_idx, sample_set in feature_to_samples.items():
+        if len(sample_set) <= k:
+            ignore.add(feature_idx)
 
-    for key, js in groups.items():
-        if key == () or len(js) == 1:
-            continue
-        js.sort()
-        ignore.update(js[1:])
+    # 2. group identical features (same sample set patterns) and keep only one from each group
+    groups = {}
+    for feature_idx, sample_set in feature_to_samples.items():
+        key = tuple(sorted(sample_set))  # unique pattern of samples containing this feature
+        groups.setdefault(key, []).append(feature_idx)
 
-    kept = GLOBAL_MAX - len(ignore)
+    for key, feature_list in groups.items():
+        if len(feature_list) > 1:
+            # mark all but the first as redundant
+            feature_list.sort()
+            ignore.update(feature_list[1:])
+
+    kept = len(feature_to_samples) - len(ignore)
     print(f"A total of {len(ignore)} feature indices will be ignored.")
     print(f"{kept} feature indices were kept.")
 

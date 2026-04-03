@@ -15,7 +15,7 @@ except ImportError:
 
 MODEL_DIR = f"models/{DECK_NAME}/ver{VER_NUMBER}"
 IGNORE = MODEL_DIR + "/ignore.roar"
-MODEL = MODEL_DIR + "/model.pt.gz"
+MODEL = MODEL_DIR + "/model.pt"
 
 # Device setup
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")

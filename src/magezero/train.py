@@ -4,9 +4,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn, optim
 from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
 import os
 import math
 import gzip
+from tqdm import tqdm
 
 
 import magezero.test as test
@@ -40,6 +42,9 @@ GLOBAL_MAX = env_int("MAGEZERO_GLOBAL_MAX", 2000000)
 EPOCH_COUNT = env_int("MAGEZERO_EPOCH_COUNT", 60)
 USE_PREVIOUS_MODEL = env_bool("MAGEZERO_USE_PREVIOUS_MODEL", False)
 BATCH_SIZE = env_int("MAGEZERO_BATCH_SIZE", 128)
+EMBEDDING_DIM = env_int("MAGEZERO_EMBEDDING_DIM", 432)
+HIDDEN_DIM = env_int("MAGEZERO_HIDDEN_DIM", 216)
+USE_MIXED_PRECISION = env_bool("MAGEZERO_MIXED_PRECISION", True)
 
 
 #TODO: wire into xmage data pipeline
@@ -93,8 +98,8 @@ class Net(nn.Module):
         super().__init__()
 
 
-        embedding_dim = 512  # Output of EmbeddingBag
-        hidden_dim_mlp = 256  # Output of the main MLP block
+        embedding_dim = EMBEDDING_DIM  # Output of EmbeddingBag
+        hidden_dim_mlp = HIDDEN_DIM  # Output of the main MLP block
         self.embedding_bag = nn.EmbeddingBag(
             num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
@@ -150,6 +155,19 @@ def normalize_policy_labels(raw: torch.Tensor) -> torch.Tensor:
     return raw / total
 
 
+def find_max_embedding_index(ds: 'H5Indexed') -> int:
+    """
+    Safely scan dataset to find the maximum embedding index used.
+    This prevents allocating memory for unused embedding slots.
+    """
+    max_idx = 0
+    for i in range(len(ds)):
+        indices, _, _, _, _ = ds[i]
+        if len(indices) > 0:
+            max_idx = max(max_idx, indices.max().item())
+    return max_idx + 1  # +1 because indices are 0-based
+
+
 def train():
     os.makedirs(f"models/{DECK_NAME}/ver{VER_NUMBER}", exist_ok=True)
     ds_raw = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training")
@@ -173,6 +191,13 @@ def train():
             f.write(ignore.serialize())
 
     # model and data loaders
+    # Scan dataset to find actual max embedding index needed (not GLOBAL_MAX)
+    # print("Scanning dataset to determine actual embedding table size...")
+    # actual_max_idx = find_max_embedding_index(ds_raw)
+    # actual_embeddings_needed = min(actual_max_idx, GLOBAL_MAX)
+    # print(f"Dataset uses embeddings up to index {actual_max_idx - 1}. Allocating {actual_embeddings_needed} instead of {GLOBAL_MAX}.")
+    
+    print(f"Loading Model")
     model = Net(GLOBAL_MAX, ACTIONS_MAX).cuda()
 
     # optional start point
@@ -186,7 +211,7 @@ def train():
                 ignore_list2 = BitMap.deserialize(f.read())
                 ignore_list.intersection_update(ignore_list2)
                 #ignore_list = ignore_list2
-            print(f"intersected with previous ignore list: {len(ignore_list2)} for final ignore list: {len(ignore_list)} leaving {GLOBAL_MAX-len(ignore_list)} features")
+            print(f"intersected with previous ignore list: {len(ignore_list2)} for final ignore list: {len(ignore_list)} leaving {actual_embeddings_needed-len(ignore_list)} features")
             # opt_sparse.load_state_dict(checkpoint['optimizer_sparse_state_dict'])
             # opt_dense.load_state_dict(checkpoint['optimizer_dense_state_dict'])
             print(f"Successfully loaded checkpoint from {checkpoint_path}")
@@ -196,15 +221,15 @@ def train():
             print(f"ERROR: Could not load checkpoint. {e}. Starting from scratch.")
 
    
-
+    print(f"Creating training and testing data loaders with batch size {BATCH_SIZE}")
     #data sets with redundant filter
     ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training", ignore_list)
     test_ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/testing", ignore_list)
 
     #if round-robin filter out opponent states AFTER making the ignore list
-    if not TRAIN_OPPONENT_HEAD:
-        ds = filter_opponent_states(ds,TARGETS_MAX)
-        test_ds = filter_opponent_states(test_ds,TARGETS_MAX)
+    # if not TRAIN_OPPONENT_HEAD:
+    #     ds = filter_opponent_states(ds,TARGETS_MAX)
+    #     test_ds = filter_opponent_states(test_ds,TARGETS_MAX)
 
 
 
@@ -215,7 +240,6 @@ def train():
                     pin_memory=True, persistent_workers=False)
 
     test.SHOW_CONFUSION_MATRIX = False
-    breakpoint()
     #optimizers
     opt_sparse = optim.SparseAdam(model.embedding_bag.parameters(), lr=5e-4)
     #opt_sparse = torch.optim.Adagrad(model.embedding_bag.parameters(), lr=0.1,initial_accumulator_value=0.1)
@@ -231,19 +255,21 @@ def train():
             dense_bias_params.append(p)
 
     opt_dense = optim.Adam(dense_params, lr=5e-4)
-
-
+    
+    # Mixed precision training
+    scaler = GradScaler(enabled=USE_MIXED_PRECISION)
 
     mse = nn.MSELoss()
     kld = nn.KLDivLoss(reduction='batchmean')
 
     #main training loop
+    print(f"Beginning Training loop for {EPOCH_COUNT} epochs")
     for epoch in range(1, EPOCH_COUNT+1):
         total_pA_loss, total_pB_loss, total_t_loss, total_b_loss, total_v_loss, total_l1_sparse_loss, total_l1_dense_loss = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         total_decision_examples, total_pA_examples, total_pB_examples, total_t_examples, total_b_examples = 0,0,0,0,0
         model.train()
 
-        for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in dl:
+        for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in tqdm(dl):
             # Move new input tensors to CUDA
             batch_indices = batch_indices.cuda()
             batch_offsets = batch_offsets.cuda()
@@ -252,79 +278,82 @@ def train():
             is_players = is_players.cuda().squeeze(-1).to(torch.bool)
             action_types = action_types.cuda().squeeze(-1).to(torch.long)
 
-            # Model call uses indices and offsets
-            priority_logits, opponent_priority_logits, target_logits, binary_logits ,value_pred = model(batch_indices, batch_offsets)
+            # Model call uses indices and offsets with mixed precision
+            with autocast(enabled=USE_MIXED_PRECISION, device_type="cuda"):
+                priority_logits, opponent_priority_logits, target_logits, binary_logits ,value_pred = model(batch_indices, batch_offsets)
 
 
 
-            nonzero = (batch_policy_labels > 0).sum(dim=1)  # [B]
-            decision_mask = nonzero > 1  # [B] states where more than one action is available
-            priority_mask = (action_types==ActionType.PRIORITY.value) & is_players & decision_mask
-            opponent_priority_mask = (action_types==ActionType.PRIORITY.value) & (~is_players) & decision_mask
-            target_mask = (action_types==ActionType.CHOOSE_TARGET.value) & decision_mask
-            binary_mask = (action_types==ActionType.CHOOSE_USE.value) & decision_mask
+                nonzero = (batch_policy_labels > 0).sum(dim=1)  # [B]
+                decision_mask = nonzero > 1  # [B] states where more than one action is available
+                priority_mask = (action_types==ActionType.PRIORITY.value) & is_players & decision_mask
+                opponent_priority_mask = (action_types==ActionType.PRIORITY.value) & (~is_players) & decision_mask
+                target_mask = (action_types==ActionType.CHOOSE_TARGET.value) & decision_mask
+                binary_mask = (action_types==ActionType.CHOOSE_USE.value) & decision_mask
 
 
-            total_decision_examples += decision_mask.sum().item()
+                total_decision_examples += decision_mask.sum().item()
 
-            #priority A
-            if priority_mask.any():
-                log_probs_d = F.log_softmax(priority_logits[priority_mask][:,:PRIORITY_A_MAX], dim=1)
-                tgt = normalize_policy_labels(batch_policy_labels[priority_mask][:,:PRIORITY_A_MAX])
-                lpA = kld(log_probs_d, tgt)*lambda_pA
-                s = log_probs_d.size(0)
-                total_pA_loss += lpA.item() * s
-                total_pA_examples += s
-            else:
-                lpA = torch.zeros((), device=value_pred.device)
+                #priority A
+                if priority_mask.any():
+                    log_probs_d = F.log_softmax(priority_logits[priority_mask][:,:PRIORITY_A_MAX], dim=1)
+                    tgt = normalize_policy_labels(batch_policy_labels[priority_mask][:,:PRIORITY_A_MAX])
+                    lpA = kld(log_probs_d, tgt)*lambda_pA
+                    s = log_probs_d.size(0)
+                    total_pA_loss += lpA.item() * s
+                    total_pA_examples += s
+                else:
+                    lpA = torch.zeros((), device=value_pred.device)
 
-            #priority B (this uses virtual visits)
-            if opponent_priority_mask.any():
-                log_probs_d = F.log_softmax(opponent_priority_logits[opponent_priority_mask][:,:PRIORITY_B_MAX], dim=1)
-                tgt = normalize_policy_labels(batch_policy_labels[opponent_priority_mask][:,:PRIORITY_B_MAX])
-                lpB = kld(log_probs_d, tgt)*lambda_pB
-                s = log_probs_d.size(0)
-                total_pB_loss += lpB.item() * s
-                total_pB_examples += s
-            else:
-                lpB = torch.zeros((), device=value_pred.device)
+                #priority B (this uses virtual visits)
+                if opponent_priority_mask.any():
+                    log_probs_d = F.log_softmax(opponent_priority_logits[opponent_priority_mask][:,:PRIORITY_B_MAX], dim=1)
+                    tgt = normalize_policy_labels(batch_policy_labels[opponent_priority_mask][:,:PRIORITY_B_MAX])
+                    lpB = kld(log_probs_d, tgt)*lambda_pB
+                    s = log_probs_d.size(0)
+                    total_pB_loss += lpB.item() * s
+                    total_pB_examples += s
+                else:
+                    lpB = torch.zeros((), device=value_pred.device)
 
-            #targets (shared between both players)
-            if target_mask.any():
-                log_probs_d = F.log_softmax(target_logits[target_mask][:,:TARGETS_MAX], dim=1)
-                tgt = normalize_policy_labels(batch_policy_labels[target_mask][:,:TARGETS_MAX])
-                lt = kld(log_probs_d, tgt)*lambda_t
-                s = log_probs_d.size(0)
-                total_t_loss += lt.item() * s
-                total_t_examples += s
-            else:
-                lt = torch.zeros((), device=value_pred.device)
+                #targets (shared between both players)
+                if target_mask.any():
+                    log_probs_d = F.log_softmax(target_logits[target_mask][:,:TARGETS_MAX], dim=1)
+                    tgt = normalize_policy_labels(batch_policy_labels[target_mask][:,:TARGETS_MAX])
+                    lt = kld(log_probs_d, tgt)*lambda_t
+                    s = log_probs_d.size(0)
+                    total_t_loss += lt.item() * s
+                    total_t_examples += s
+                else:
+                    lt = torch.zeros((), device=value_pred.device)
 
-            # binary (choose to use) decisions
-            if binary_mask.any():
-                log_probs_d = F.log_softmax(binary_logits[binary_mask][:,:BINARY_MAX], dim=1)
-                tgt = normalize_policy_labels(batch_policy_labels[binary_mask][:,:BINARY_MAX])
-                lb = kld(log_probs_d, tgt)*lambda_b
-                s = log_probs_d.size(0)
-                total_b_loss += lb.item() * s
-                total_b_examples += s
-            else:
-                lb = torch.zeros((), device=value_pred.device)
+                # binary (choose to use) decisions
+                if binary_mask.any():
+                    log_probs_d = F.log_softmax(binary_logits[binary_mask][:,:BINARY_MAX], dim=1)
+                    tgt = normalize_policy_labels(batch_policy_labels[binary_mask][:,:BINARY_MAX])
+                    lb = kld(log_probs_d, tgt)*lambda_b
+                    s = log_probs_d.size(0)
+                    total_b_loss += lb.item() * s
+                    total_b_examples += s
+                else:
+                    lb = torch.zeros((), device=value_pred.device)
 
-            lv = mse(value_pred, batch_value_labels.squeeze(-1))
-            l1_dense = 0
-            for param in dense_weight_params:
-                l1_dense += torch.sum(torch.abs(param))
-            l1_dense *= 1e-5
+                lv = mse(value_pred, batch_value_labels.squeeze(-1))
+                l1_dense = 0
+                for param in dense_weight_params:
+                    l1_dense += torch.sum(torch.abs(param))
+                l1_dense *= 1e-5
 
-            total_l1_dense_loss += l1_dense.item()
-            total_l1_sparse_loss += model.l1_penalty.item()
-            loss = lpA + lpB + lt + lb + lv #+ model.l1_penalty #+ l1_dense
+                total_l1_dense_loss += l1_dense.item()
+                total_l1_sparse_loss += model.l1_penalty.item()
+                loss = lpA + lpB + lt + lb + lv #+ model.l1_penalty #+ l1_dense
+            
             opt_sparse.zero_grad()
             opt_dense.zero_grad()
-            loss.backward()
-            opt_sparse.step()
-            opt_dense.step()
+            scaler.scale(loss).backward()
+            scaler.step(opt_sparse)
+            scaler.step(opt_dense)
+            scaler.update()
 
 
             total_v_loss += lv.item()

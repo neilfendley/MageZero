@@ -81,16 +81,21 @@ def load_model(path, device='cpu'):
     
     if path.endswith('.gz'):
         # Pre-decompress to temporary file for faster loading
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
+        # import tempfile
+        # with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as tmp:
+        #     tmp_path = tmp.name
+        print("Only found compressed model, decompressing now")
+        decompressed_path = path[:-3]  # Remove .gz extension
+        if not os.path.exists(decompressed_path):
             with gzip.open(path, 'rb') as f_in:
-                with open(tmp_path, 'wb') as f_out:
+                with open(decompressed_path, 'wb') as f_out:
                     f_out.write(f_in.read())
-            out = torch.load(tmp_path, map_location=device, weights_only=False)
-        finally:
-            os.unlink(tmp_path)
+            print("Finished Decompressing Model")
+            out = torch.load(decompressed_path, map_location=device, weights_only=False)
+        else:
+            out = torch.load(path, map_location=device, weights_only=False)
+
+        #     os.unlink(tmp_path)
     else:
         out = torch.load(path, map_location=device, weights_only=False)
     
@@ -394,7 +399,7 @@ def train():
         #TODO: make validation based checkpoint schedule
         if epoch == EPOCH_COUNT:
             checkpoint_save_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt.gz"
-            with gzip.open(checkpoint_save_path, 'wb') as f:
+            with open(checkpoint_save_path, 'wb') as f:
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),

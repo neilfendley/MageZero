@@ -46,15 +46,19 @@ def load_server_artifacts():
         ignore_bm = BitMap.deserialize(f.read())
 
     model = Net(GLOBAL_MAX, ACTIONS_MAX).to(DEVICE).eval()
+    print(f'Model loaded, now loading weights from {MODEL}')
     ckpt = load_model(MODEL)
     model.load_state_dict(ckpt["model_state_dict"])
+    print("Model weights loaded.")
     return model, ignore_bm
 
 
 def reload_server_model():
     global server_model, IGNORE_BM
-
+    print("Loading server artifacts...")
     model, ignore_bm = load_server_artifacts()
+    print("Server model loaded.")
+
     with model_lock:
         server_model = model
         IGNORE_BM = ignore_bm

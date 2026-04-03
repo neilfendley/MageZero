@@ -39,6 +39,7 @@ ACTIONS_MAX = env_int("MAGEZERO_ACTIONS_MAX", 128)
 GLOBAL_MAX = env_int("MAGEZERO_GLOBAL_MAX", 2000000)
 EPOCH_COUNT = env_int("MAGEZERO_EPOCH_COUNT", 60)
 USE_PREVIOUS_MODEL = env_bool("MAGEZERO_USE_PREVIOUS_MODEL", False)
+BATCH_SIZE = env_int("MAGEZERO_BATCH_SIZE", 128)
 
 
 #TODO: wire into xmage data pipeline
@@ -154,10 +155,22 @@ def train():
     ds_raw = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training")
     print(torch.cuda.is_available())
 
+    ##Ignore handling
+    ignore_list_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar"
+    if os.path.exists(ignore_list_path):
+        print("Loading existing ignore list from ignore.roar")
+        with open(ignore_list_path, "rb") as f:
+            loaded_bitmap = BitMap.deserialize(f.read())
+        ignore_list = list(loaded_bitmap)
+    else:
+        print("Generating ignore list from dataset to use for model")
+        ignore_list = create_redundancy_ignore_list(ds_raw)
+        if not MAKE_IGNORE_LIST: ignore_list = []
+        print("Saving ignore list to ignore.roar")
 
-    #ignore handling
-    print("Generating ignore list from dataset to use for model")
-    ignore_list = create_redundancy_ignore_list(ds_raw)
+        ignore = BitMap(ignore_list)  # iterable of ints
+        with open(f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar", "wb") as f:
+            f.write(ignore.serialize())
 
     # model and data loaders
     model = Net(GLOBAL_MAX, ACTIONS_MAX).cuda()
@@ -182,12 +195,7 @@ def train():
         except Exception as e:
             print(f"ERROR: Could not load checkpoint. {e}. Starting from scratch.")
 
-    if not MAKE_IGNORE_LIST: ignore_list = []
-    print("Saving ignore list to ignore.roar")
-
-    ignore = BitMap(ignore_list)  # iterable of ints
-    with open(f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar", "wb") as f:
-        f.write(ignore.serialize())
+   
 
     #data sets with redundant filter
     ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training", ignore_list)
@@ -200,14 +208,14 @@ def train():
 
 
 
-    dl = DataLoader(ds, batch_size=128, shuffle=True, num_workers=0, collate_fn=collate_batch,
+    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, collate_fn=collate_batch,
                     pin_memory=True, persistent_workers=False)
 
-    dl_test = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=0, collate_fn=collate_batch,
+    dl_test = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, collate_fn=collate_batch,
                     pin_memory=True, persistent_workers=False)
 
     test.SHOW_CONFUSION_MATRIX = False
-
+    breakpoint()
     #optimizers
     opt_sparse = optim.SparseAdam(model.embedding_bag.parameters(), lr=5e-4)
     #opt_sparse = torch.optim.Adagrad(model.embedding_bag.parameters(), lr=0.1,initial_accumulator_value=0.1)

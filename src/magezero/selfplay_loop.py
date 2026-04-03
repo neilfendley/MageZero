@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run MageZero self-play/training/reload loops with KrenkoMain."
     )
-    parser.add_argument("--deck-path", required=True, help="Deck path relative to the mage repo, e.g. decks/IzzetElementals.dck")
+    parser.add_argument("--deck-path", default='decks/IzzetElementals.dck', help="Deck path relative to the mage repo, e.g. decks/IzzetElementals.dck")
     parser.add_argument("--deck-name", help="Deck name used under MageZero/data and MageZero/models. Defaults to the deck filename stem.")
     parser.add_argument("--version", type=int, default=0, help="MageZero model/data version number.")
     parser.add_argument("--iterations", type=int, default=1, help="Number of self-play/train cycles to run.")
@@ -76,9 +76,9 @@ def run_command(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) ->
 
 def start_server(args: argparse.Namespace, env: dict[str, str]) -> subprocess.Popen:
     cmd = [
-        args.python,
-        "-m",
-        "waitress",
+        # args.python,
+        # "-m",
+        "waitress-serve",
         f"--host={args.server_host}",
         f"--port={args.server_port}",
         f"--threads={args.server_threads}",
@@ -155,7 +155,7 @@ def main() -> None:
 
     server = start_server(args, base_env)
     try:
-        wait_for_http(f"http://{args.server_host}:{args.server_port}/healthz")
+        wait_for_http(f"http://{args.server_host}:{args.server_port}/healthz", timeout_s=360)
         print("[server] ready", flush=True)
 
         for iteration in range(1, args.iterations + 1):

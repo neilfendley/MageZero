@@ -42,8 +42,8 @@ GLOBAL_MAX = env_int("MAGEZERO_GLOBAL_MAX", 2000000)
 EPOCH_COUNT = env_int("MAGEZERO_EPOCH_COUNT", 60)
 USE_PREVIOUS_MODEL = env_bool("MAGEZERO_USE_PREVIOUS_MODEL", False)
 BATCH_SIZE = env_int("MAGEZERO_BATCH_SIZE", 128)
-EMBEDDING_DIM = env_int("MAGEZERO_EMBEDDING_DIM", 432)
-HIDDEN_DIM = env_int("MAGEZERO_HIDDEN_DIM", 216)
+EMBEDDING_DIM = env_int("MAGEZERO_EMBEDDING_DIM", 284)
+HIDDEN_DIM = env_int("MAGEZERO_HIDDEN_DIM", 142)
 USE_MIXED_PRECISION = env_bool("MAGEZERO_MIXED_PRECISION", True)
 
 
@@ -69,13 +69,34 @@ lambda_pB = head_weight(PRIORITY_B_MAX)
 lambda_t = head_weight(TARGETS_MAX)
 lambda_b = head_weight(BINARY_MAX)
 
-def load_model(path):
+def load_model(path, device='cpu'):
+    """Load model checkpoint with optimized device mapping.
+    
+    Args:
+        path: Path to model file (.pt or .pt.gz)
+        device: Device to load model to (e.g., 'cpu', 'cuda')
+    """
+    import time
+    start = time.time()
+    
     if path.endswith('.gz'):
-        with gzip.open(path, 'rb') as f:
-            out = torch.load(f, map_location=torch.device('cpu'))
-            return out
-
-    return torch.load(path)
+        # Pre-decompress to temporary file for faster loading
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            with gzip.open(path, 'rb') as f_in:
+                with open(tmp_path, 'wb') as f_out:
+                    f_out.write(f_in.read())
+            out = torch.load(tmp_path, map_location=device, weights_only=False)
+        finally:
+            os.unlink(tmp_path)
+    else:
+        out = torch.load(path, map_location=device, weights_only=False)
+    
+    elapsed = time.time() - start
+    print(f'  load_model: {elapsed:.2f}s')
+    return out
 
 
 class ActionType(Enum):

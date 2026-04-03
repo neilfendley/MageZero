@@ -76,9 +76,9 @@ def run_command(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) ->
 
 def start_server(args: argparse.Namespace, env: dict[str, str]) -> subprocess.Popen:
     cmd = [
-        # args.python,
-        # "-m",
-        "waitress-serve",
+        args.python,
+        "-m",
+        "waitress",
         f"--host={args.server_host}",
         f"--port={args.server_port}",
         f"--threads={args.server_threads}",

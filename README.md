@@ -10,7 +10,11 @@ This approach reframes the challenge of MTG AI from universal mastery to local o
 
 ### 2. Current Status (December 2025): **Learning-MCTS agent implemented in Parallel AIvsAI environment in XMage**
 
+This project uses [XMage](https://github.com/magefree/mage), an Open Source complete MTG rules engine as a gym environment. See this project's [XMage fork](https://github.com/WillWroble/mage) for the State vectorization and MCTS logic. (relevant modules: `Player.AI.RL`, `Player.AI.MCTS`, `Tests/src/java/org.mage.test/AI/RL`)
+
 The core infrastructure for MageZero is complete and undergoing testing. The full end-to-end pipeline from simulation and data generation in Java to model training in PyTorch and back to inference via local python server is functional.
+
+The first alpha release (with precompiled XMage module) is planned for early February.
 
 If you are interested in contributing or running locally see the [setup guide](https://github.com/WillWroble/MageZero/blob/main/setup_guide.md). I am also always available at <willwroble@gmail.com>
 
@@ -63,13 +67,18 @@ See results/roundrobin-trainlog.txt for raw data
 
 ---
 
+### 3.2 Emergent Behavior
+
+By far the most interesting emergent behavior to come from MageZero so far, came from the card [Cecil Death Knight](https://scryfall.com/card/fin/380/cecil-dark-knight-cecil-redeemed-paladin). While playing against the [Standard-MonoB](https://moxfield.com/decks/R3zCVSK78kWyOwzAUyHUJg) deck agent i've been training, I noticed from the logs it wasn't playing its one-drop, Cecil, despite having nothing else to do on the first 2 turns. I initially assumed this was a glitch as I was on the play and was curving out (playing the same deck myself). By the time it played it, (on turn 3 with 12 life), I realized what it was doing actually made perfect sense. If it had played Cecil, (a 2/3 deathtoucher) it would have stopped my attacks and it would have probably just sat there as a 2/3 the whole game. By letting me lower it's life total before playing it, Cecil immediatly becomes a threat, since on the next turn they can remove any blockers and flip it by attacking, which is exactly what it did. this is starting to feel like signs of life of a true AlphaZero agent. ie. completely weird, 'creative' play patterns that only come from pure, unbiased RL. an LLM bot (or a bot trained on human games) would never do this in a million years. I've played with Cecil on MTG arena and never thought of playing it this way. But next time I play standard I'll try this strategy, since it makes sense to me for many situations.
+
+---
 ### 4. Core Components & Pipeline
 
 MageZero's architecture is an end-to-end self-improvement cycle.
 
 #### **Game Engine & Feature Encoding**
 
-MageZero is implemented atop XMage, an open-source MTG simulator. Game state is captured via a custom `StateEncoder.java`, which converts each decision point into a high-dimensional binary feature vector.
+Within the XMage fork, Game state is captured via a custom `StateEncoder.java`, which converts each decision point into a high-dimensional binary feature vector.
 
 * **Dynamic Feature Hashing**: This system supports a sparse, open-ended state representation to handle all the discrete artifacts and tokens MTG games can produce. This is done by use of a massive sparse Embedding Bag (2M features) with Weinberger style feature hashing. A typical 60card deck matchup utilizes a \~5,000 feature slice of this space. With usually around ~200 active features per state (after filtering redundant features) making chance of collision <0.01%. Since all decks share the same massive input space, overlapping deck feature slices allow for potential cross-deck learning.
 * **Hierarchical & Abstracted Features**: The hashing captures not just card presence but also sub-features (like abilities on a card) and game metadata (life totals, turn phase). Numeric features are discretized, and cardinality is represented through thresholds. Sub-features pool up to parent features, creating additional layers of abstraction (e.g., a "green" sub-feature on a creature contributes to a "green permanents on the battlefield" count), providing a richer, more redundant signal for the model.
@@ -86,9 +95,9 @@ The model is a specialized Multi-Layer Perceptron (MLP) with a 2M dimension Embe
     * **Player Priority**: 128D; deck local; each logit corresponds to a priority action the Agent (PlayerA) can take (eg. activated abilities, casting spells). usually around ~20 logits are used per deck
     * **Opponent Priority**: 128D; opponent deck local; each logit corresponds to a priority action the opponent (PlayerB could take). when running MCTS vs MCTS games. both Agents share one network. and use each head.
     * **Targets**: 128D; matchup local; shared target space across both decks for all micro decisions involving targets. (this is used for selecting which attacking creature to use a blocker on). usually ~60 logits used per matchup
-    * **Binary decisions** 2D: matchup local; shared binary space for all binary decisions made by either player. (this is used to select blockers and attackers sequentially)
-  * **Value Head**: Estimates the probability of winning (trained with Mean Squared Error). The target blends the MCTS root score (as in MuZero) with a discounted terminal reward.
-* **Optimization**: The network uses a combination of Adam and SparseAdam optimizers. Training incorporates dropout layers (p=0.3) for regularization.
+    * **Binary decisions** 2D: matchup local; shared binary space for all binary decisions made by either player. (this is used to select attackers sequentially)
+  * **Value Head**: Estimates the probability of winning (trained with Mean Squared Error). The value target uses a MuZero style TD-blend over MCTS roots scores for richer, more stable value predictions.
+* **Optimization**: The network uses a combination of Adam and SparseAdam optimizers. Training incorporates dropout layers (p=0.5) for regularization.
 * **Training**: all training samples are flagged with their decision type (player priority, opponent priority, target decision, binary decision). all sample types are trained together in mixed batches but policy gradients are gated to each sample's corresponding policy head. 
 
 
@@ -103,7 +112,7 @@ we use c = 1.0. but otherwise keep the formula the same. however there were many
 
 For one, unlike Chess, MTG has many different type of decision points. (priority, choosing targets, ordering triggers, attacking etc.) This is why we use a special policy head for each one, since all of these decisions can be game swinging and are highly learnable.
 
-We also don't use and Dirichlet noise or temp sampling like the original AlphaZero authors did. Instead, we found we were able to get stable network progression by increasing search depth since MTG already has a lot of inherent randomness. 
+We also don't use and Dirichlet noise or temperature sampling like the original AlphaZero authors did. Instead, we found we were able to get stable network progression by increasing search depth since MTG already has a lot of inherent randomness. 
 
 Another key difference was using a TD-style discounting blend between intermediate MCTS root scores, and the next value target. This is much more stable than terminal only and stays bounded for MCTS. ($0.9 \leq \lambda \leq 0.95$ )
 

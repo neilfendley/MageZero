@@ -46,6 +46,7 @@ BATCH_SIZE = env_int("MAGEZERO_BATCH_SIZE", 128)
 EMBEDDING_DIM = env_int("MAGEZERO_EMBEDDING_DIM", 432)
 HIDDEN_DIM = env_int("MAGEZERO_HIDDEN_DIM", 216)
 USE_MIXED_PRECISION = env_bool("MAGEZERO_MIXED_PRECISION", True)
+NUM_WORKERS = env_int("MAGEZERO_NUM_WORKERS", 4)
 
 
 #TODO: wire into xmage data pipeline
@@ -262,10 +263,10 @@ def train():
 
 
 
-    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, collate_fn=collate_batch,
+    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, collate_fn=collate_batch,
                     pin_memory=True, persistent_workers=False)
 
-    dl_test = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, collate_fn=collate_batch,
+    dl_test = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, collate_fn=collate_batch,
                     pin_memory=True, persistent_workers=False)
 
     test.SHOW_CONFUSION_MATRIX = False
@@ -400,7 +401,7 @@ def train():
         if len(test_ds)>0:
             test.validate(model, dl_test)
         #TODO: make validation based checkpoint schedule
-        if epoch == EPOCH_COUNT:
+        if epoch == EPOCH_COUNT or (epoch % 10) == 0:
             checkpoint_save_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt"
             # with open(checkpoint_save_path, 'wb') as f:
             torch.save({

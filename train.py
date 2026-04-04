@@ -7,6 +7,8 @@ from torch.utils.data import DataLoader
 import os
 import math
 import gzip
+import shutil
+
 
 
 import test
@@ -14,19 +16,18 @@ from dataset import H5Indexed, collate_batch,  create_redundancy_ignore_list, fi
 from pyroaring import BitMap
 
 #add training data under: data/{deck name}/ver{your version num}/training/{your data}.hdf5
-DECK_NAME = "Standard-MonoU"
-VER_NUMBER = 1
+DECK_NAME = "UWTempo"
+VER_NUMBER = 18
 
 MAKE_IGNORE_LIST = True
-TRAIN_OPPONENT_HEAD = False #turn off when training on round-robin data
+TRAIN_OPPONENT_HEAD = True #turn off when training on round-robin data
 ACTIONS_MAX = 128
 GLOBAL_MAX = 2000000
 EPOCH_COUNT = 10
 USE_PREVIOUS_MODEL = True
 
 
-#TODO: wire into xmage data pipeline
-#for now just manually enter your matchup-specific action space sizes here for optimal normalization(XMage prints them at the start of each run)
+
 PRIORITY_A_MAX = 128
 PRIORITY_B_MAX = 128
 TARGETS_MAX = 128
@@ -80,12 +81,12 @@ class Net(nn.Module):
             num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
             mode='sum',
-            sparse=True
-            #,max_norm=1
+            sparse=True,
+            max_norm=1
         )
         self.embedding_bias = nn.Parameter(torch.zeros(embedding_dim))
         self.input_dropout = 0
-        self.embedding_norm = nn.LayerNorm(embedding_dim)
+        #self.embedding_norm = nn.LayerNorm(embedding_dim)
         self.embedding_dropout = nn.Dropout(p=0.5)
         self.l1_penalty = None
 
@@ -118,7 +119,7 @@ class Net(nn.Module):
 
         #emb = emb + self.embedding_bias
         #emb = F.relu(emb)
-        emb = self.embedding_norm(emb)
+        #emb = self.embedding_norm(emb)
 
 
         emb = self.embedding_dropout(emb)
@@ -155,8 +156,6 @@ def train():
                 ignore_list.intersection_update(ignore_list2)
                 #ignore_list = ignore_list2
             print(f"intersected with previous ignore list: {len(ignore_list2)} for final ignore list: {len(ignore_list)} leaving {GLOBAL_MAX-len(ignore_list)} features")
-            # opt_sparse.load_state_dict(checkpoint['optimizer_sparse_state_dict'])
-            # opt_dense.load_state_dict(checkpoint['optimizer_dense_state_dict'])
             print(f"Successfully loaded checkpoint from {checkpoint_path}")
         except FileNotFoundError:
             print(f"INFO: Checkpoint file not found at {checkpoint_path}. Starting from scratch.")
@@ -190,7 +189,7 @@ def train():
     test.SHOW_CONFUSION_MATRIX = False
 
     #optimizers
-    opt_sparse = optim.SparseAdam(model.embedding_bag.parameters(), lr=5e-4)
+    opt_sparse = optim.SparseAdam(model.embedding_bag.parameters(), lr=1e-4)
     #opt_sparse = torch.optim.Adagrad(model.embedding_bag.parameters(), lr=0.1,initial_accumulator_value=0.1)
     dense_params = []
     dense_weight_params, dense_bias_params = [], []
@@ -231,7 +230,7 @@ def train():
 
 
             nonzero = (batch_policy_labels > 0).sum(dim=1)  # [B]
-            decision_mask = nonzero > 1  # [B] states where more than one action is available
+            decision_mask = nonzero > 0  # [B] states where at least one action is available
             priority_mask = (action_types==ActionType.PRIORITY.value) & is_players & decision_mask
             opponent_priority_mask = (action_types==ActionType.PRIORITY.value) & (~is_players) & decision_mask
             target_mask = (action_types==ActionType.CHOOSE_TARGET.value) & decision_mask
@@ -317,15 +316,24 @@ def train():
         #TODO: make validation based checkpoint schedule
         if epoch == EPOCH_COUNT:
             checkpoint_save_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt.gz"
-            with gzip.open(checkpoint_save_path, 'wb') as f:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_sparse_state_dict': opt_sparse.state_dict(),
-                    'optimizer_dense_state_dict': opt_dense.state_dict(),
-                    'avg_p_loss': avg_pA_loss,  # Optional: save last losses
-                    'avg_v_loss': avg_v_loss,
-                }, f)
+            temp_path = checkpoint_save_path.replace('.gz', '.tmp')
+
+            # Save uncompressed
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_sparse_state_dict': opt_sparse.state_dict(),
+                'optimizer_dense_state_dict': opt_dense.state_dict(),
+                'avg_p_loss': avg_pA_loss,
+                'avg_v_loss': avg_v_loss,
+            }, temp_path)
+
+            # Stream-compress in chunks (constant memory)
+            with open(temp_path, 'rb') as f_in:
+                with gzip.open(checkpoint_save_path, 'wb', compresslevel=1) as f_out:
+                    shutil.copyfileobj(f_in, f_out, length=16 * 1024 * 1024)  # 16MB chunks
+
+            os.remove(temp_path)
 
 if __name__ == "__main__":
     train()

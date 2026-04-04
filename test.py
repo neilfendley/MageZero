@@ -33,14 +33,15 @@ def print_matrix(matrix):
             print(row_str)
     else:
         # Print header for predicted actions
-        header = "True |" + "".join([f"{j: >4}" for j in range(matrix_size)])
+        indices = [i for i in range(matrix_size) if matrix[i].sum() > 0]
+        header = "True |" + "".join([f"{j: >4}" for j in indices])
         print(header)
         print("-" * len(header))
 
         # Print each row for true actions
-        for r in range(matrix_size):
+        for r in indices:
             row_str = f"{r: >4} |"
-            row_str += "".join([f"{matrix[r, c].item(): >4}" for c in range(matrix_size)])
+            row_str += "".join([f"{matrix[r, c].item(): >4}" for c in indices])
             print(row_str)
 
     print("-" * 60)
@@ -76,7 +77,7 @@ def validate(model, dl):
                                                                                                         batch_offsets)
 
             nonzero = (batch_policy_labels > 0).sum(dim=1)  # [B]
-            decision_mask = nonzero > 1  # [B] states where more than one action is available
+            decision_mask = nonzero > 0  # [B] states where more than one action is available
             priority_mask = (action_types == train.ActionType.PRIORITY.value) & is_players & decision_mask
             opponent_priority_mask = (action_types == train.ActionType.PRIORITY.value) & (~is_players) & decision_mask
             target_mask = (action_types == train.ActionType.CHOOSE_TARGET.value) & decision_mask

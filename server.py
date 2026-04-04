@@ -30,11 +30,11 @@ ckpt = load_model(MODEL)
 server_model.load_state_dict(ckpt["model_state_dict"])
 
 # Threading config
-TORCH_THREADS = max(1, os.cpu_count() // 2)
+TORCH_THREADS = 1 #max(1, os.cpu_count() // 2)
 torch.set_num_threads(TORCH_THREADS)
 
 # Batching config
-MAX_BATCH = 2
+MAX_BATCH = 16
 MAX_WAIT_MS = 0
 
 app = Flask(__name__)
@@ -169,7 +169,7 @@ def worker_loop():
             p.t_done = time.perf_counter()
             p.evt.set()
 
-        print(f"[BATCH] size={len(batch)}, total_bags={row}")
+        print(f"[BATCH] size={len(batch)}, total_bag_size={row}")
 
 
 threading.Thread(target=worker_loop, daemon=True).start()
@@ -187,7 +187,7 @@ def evaluate():
     offsets = data.get("offsets", [])
     pending = Pending(req_counter, indices, offsets)
 
-    print(f"[REQ {pending.req_id}] indices={pending.pre_count}, kept={pending.post_count}, bags={pending.num_bags}")
+    print(f"[REQ {pending.req_id}] indices={pending.pre_count}, kept={pending.post_count}, bag_size={pending.num_bags}")
 
     Q.put(pending)
     pending.evt.wait()

@@ -231,7 +231,7 @@ def filter_opponent_states(dataset, targets_max):
 
     for i in range(n):
         _, policy, _, is_player, d_type = dataset[i]  # (indices, policy, value, isPlayer, decision type)
-        if is_player:
+        if not ((not is_player) and d_type == 0) : #keep anything but opponent priorities
             keep_states.append(i)
 
 

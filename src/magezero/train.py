@@ -5,136 +5,28 @@ import torch.nn.functional as F
 from torch import nn, optim
 from torch.utils.data import DataLoader
 import os
-import math
 import gzip
 import shutil
 
-
-
 import test
+from model import Net, load_model, GLOBAL_MAX, ACTIONS_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
 from dataset import H5Indexed, collate_batch,  create_redundancy_ignore_list, filter_opponent_states
 from pyroaring import BitMap
 
 #add training data under: data/{deck name}/ver{your version num}/training/{your data}.hdf5
-DECK_NAME = "UWTempo"
-VER_NUMBER = 18
-
-MAKE_IGNORE_LIST = True
-TRAIN_OPPONENT_HEAD = True #turn off when training on round-robin data
-ACTIONS_MAX = 128
-GLOBAL_MAX = 2000000
-EPOCH_COUNT = 10
-USE_PREVIOUS_MODEL = True
 
 
 
-PRIORITY_A_MAX = 128
-PRIORITY_B_MAX = 128
-TARGETS_MAX = 128
-BINARY_MAX = 2
-
-def head_weight(K: int) -> float:
-    """
-    Analytic loss weight to equalize baseline CE scales:
-    lambda_K = ln(2) / ln(K)
-    """
-    if K <= 1:
-        raise ValueError("K must be >= 2 for cross-entropy.")
-    return math.log(2.0) / math.log(float(K))
-
-#per head weights
-lambda_pA = head_weight(PRIORITY_A_MAX)
-lambda_pB = head_weight(PRIORITY_B_MAX)
-lambda_t = head_weight(TARGETS_MAX)
-lambda_b = head_weight(BINARY_MAX)
-
-def load_model(path):
-    if path.endswith('.gz'):
-        with gzip.open(path, 'rb') as f:
-            return torch.load(f)
-    return torch.load(path)
-
-
-class ActionType(Enum):
-    PRIORITY = 0
-    CHOOSE_TARGET = 3
-    CHOOSE_USE = 5
-
-"""
-MageZero Neural Network architecture for AlphaZero style MCTS:
-2M sparse embedding bag -> 512D embedding layer -> 256D hidden layer -> (3 x 128D policy heads + 2D binary policy head + 1D value head)
-
-Policy heads are for each decision type (disjoint action spaces) they are:
-128D PriorityA (priority actions for PlayerA - which is this agent)
-128D PriorityB (priority actions for PlayerB - which is the opponent)
-128D Choose Target (target choices for both players)
-2D Choose Use (binary decisions for either player - this is used for selecting attackers and blockers)
-"""
-class Net(nn.Module):
-    def __init__(self, num_embeddings, policy_size_A):
-        super().__init__()
-
-
-        embedding_dim = 512  # Output of EmbeddingBag
-        hidden_dim_mlp = 256  # Output of the main MLP block
-        self.embedding_bag = nn.EmbeddingBag(
-            num_embeddings=num_embeddings,
-            embedding_dim=embedding_dim,
-            mode='sum',
-            sparse=True,
-            max_norm=1
-        )
-        self.embedding_bias = nn.Parameter(torch.zeros(embedding_dim))
-        self.input_dropout = 0
-        #self.embedding_norm = nn.LayerNorm(embedding_dim)
-        self.embedding_dropout = nn.Dropout(p=0.5)
-        self.l1_penalty = None
-
-        self.fc_after_embedding = nn.Sequential(
-            nn.Linear(embedding_dim, hidden_dim_mlp),  # From 512 to 256
-            nn.ReLU(),
-        )
-        #policy heads (4 x 256->128 + 1 x 256->2)
-        self.player_priority_head = nn.Linear(hidden_dim_mlp, policy_size_A)
-        self.opponent_priority_head = nn.Linear(hidden_dim_mlp, policy_size_A)
-        self.target_head = nn.Linear(hidden_dim_mlp, policy_size_A)
-        self.binary_head = nn.Linear(hidden_dim_mlp, 2)
-
-        self.value_head = nn.Sequential(
-            nn.Linear(hidden_dim_mlp, 1),  # From 256 to 1
-            nn.Tanh()
-        )
-
-    def forward(self, indices, offsets):
-        input_weights = None
-        if self.training and self.input_dropout > 0:
-            keep_mask = torch.rand_like(indices, dtype=torch.float32) > self.input_dropout
-            keep_mask = keep_mask.to(torch.float32)
-            input_weights = keep_mask / (1.0 - self.input_dropout)
-
-        emb = self.embedding_bag(indices, offsets, per_sample_weights=input_weights)
-
-        if self.training:
-            self.l1_penalty = emb.abs().sum() * 1e-7
-
-        #emb = emb + self.embedding_bias
-        #emb = F.relu(emb)
-        #emb = self.embedding_norm(emb)
-
-
-        emb = self.embedding_dropout(emb)
-        h = self.fc_after_embedding(emb)
-        return self.player_priority_head(h), self.opponent_priority_head(h), self.target_head(h), self.binary_head(h), self.value_head(h).squeeze(-1)
-
-
-def normalize_policy_labels(raw: torch.Tensor) -> torch.Tensor:
-    total = raw.sum(dim=1, keepdim=True).clamp(min=1e-8)
-    return raw / total
-
-
-def train():
-    os.makedirs(f"models/{DECK_NAME}/ver{VER_NUMBER}", exist_ok=True)
-    ds_raw = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training")
+def train(
+        deck: str,
+        version: int,
+        epochs: int,
+        use_checkpoint: bool = False,
+        make_ignore_list: bool = True,
+        train_opponent_head: bool = True,
+):
+    os.makedirs(f"models/{deck}/ver{version}", exist_ok=True)
+    ds_raw = H5Indexed(f"data/{deck}/ver{version}/training")
 
 
     #ignore handling
@@ -145,13 +37,13 @@ def train():
     model = Net(GLOBAL_MAX, ACTIONS_MAX).cuda()
 
     # optional start point
-    if USE_PREVIOUS_MODEL:
-        checkpoint_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt.gz"
+    if use_checkpoint:
+        checkpoint_path = f"models/{deck}/ver{version}/model.pt.gz"
         try:
             #checkpoint = torch.load(checkpoint_path, map_location="cuda")
             checkpoint = load_model(checkpoint_path)
             model.load_state_dict(checkpoint['model_state_dict'])
-            with open(f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar", "rb") as f:
+            with open(f"models/{deck}/ver{version}/ignore.roar", "rb") as f:
                 ignore_list2 = BitMap.deserialize(f.read())
                 ignore_list.intersection_update(ignore_list2)
                 #ignore_list = ignore_list2
@@ -162,19 +54,19 @@ def train():
         except Exception as e:
             print(f"ERROR: Could not load checkpoint. {e}. Starting from scratch.")
 
-    if not MAKE_IGNORE_LIST: ignore_list = []
+    if not make_ignore_list: ignore_list = []
     print("Saving ignore list to ignore.roar")
 
     ignore = BitMap(ignore_list)  # iterable of ints
-    with open(f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar", "wb") as f:
+    with open(f"models/{deck}/ver{version}/ignore.roar", "wb") as f:
         f.write(ignore.serialize())
 
     #data sets with redundant filter
-    ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training", ignore_list)
-    test_ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/testing", ignore_list)
+    ds = H5Indexed(f"data/{deck}/ver{version}/training", ignore_list)
+    test_ds = H5Indexed(f"data/{deck}/ver{version}/testing", ignore_list)
 
     #if round-robin filter out opponent states AFTER making the ignore list
-    if not TRAIN_OPPONENT_HEAD:
+    if not train_opponent_head:
         ds = filter_opponent_states(ds,TARGETS_MAX)
         test_ds = filter_opponent_states(test_ds,TARGETS_MAX)
 
@@ -210,7 +102,7 @@ def train():
     kld = nn.KLDivLoss(reduction='batchmean')
 
     #main training loop
-    for epoch in range(1, EPOCH_COUNT+1):
+    for epoch in range(1, epochs+1):
         total_pA_loss, total_pB_loss, total_t_loss, total_b_loss, total_v_loss, total_l1_sparse_loss, total_l1_dense_loss = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         total_decision_examples, total_pA_examples, total_pB_examples, total_t_examples, total_b_examples = 0,0,0,0,0
         model.train()
@@ -314,8 +206,8 @@ def train():
         if len(test_ds)>0:
             test.validate(model, dl_test)
         #TODO: make validation based checkpoint schedule
-        if epoch == EPOCH_COUNT:
-            checkpoint_save_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt.gz"
+        if epoch == epochs:
+            checkpoint_save_path = f"models/{deck}/ver{version}/model.pt.gz"
             temp_path = checkpoint_save_path.replace('.gz', '.tmp')
 
             # Save uncompressed
@@ -336,4 +228,11 @@ def train():
             os.remove(temp_path)
 
 if __name__ == "__main__":
-    train()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--deck", required=True)
+    parser.add_argument("--version", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--checkpoint", action="store_true")
+    args = parser.parse_args()
+    train(args.deck, args.version, args.epochs, args.checkpoint)

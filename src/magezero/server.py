@@ -4,30 +4,14 @@ import time
 from queue import Queue, Empty
 
 import torch
+import waitress
 from pyroaring import BitMap
 from flask import Flask, request, Response
 import msgpack
-
-from train import Net, GLOBAL_MAX, ACTIONS_MAX, VER_NUMBER, DECK_NAME, load_model
-
-MODEL_DIR = f"models/{DECK_NAME}/ver{VER_NUMBER}"
-IGNORE = MODEL_DIR + "/ignore.roar"
-MODEL = MODEL_DIR + "/model.pt.gz"
+from model import Net, load_model, GLOBAL_MAX, ACTIONS_MAX
 
 # Device setup
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Load ignore bitmap
-with open(IGNORE, "rb") as f:
-    IGNORE_BM = BitMap.deserialize(f.read())
-
-# Valid range bitmap for bounds checking (roaring compresses this to ~bytes)
-VALID_RANGE = BitMap(range(GLOBAL_MAX))
-
-# Load model
-server_model = Net(GLOBAL_MAX, ACTIONS_MAX).to(DEVICE).eval()
-ckpt = load_model(MODEL)
-server_model.load_state_dict(ckpt["model_state_dict"])
 
 # Threading config
 TORCH_THREADS = 1 #max(1, os.cpu_count() // 2)
@@ -37,11 +21,36 @@ torch.set_num_threads(TORCH_THREADS)
 MAX_BATCH = 16
 MAX_WAIT_MS = 0
 
+#module state
+server_model = None
+IGNORE_BM = None
+VALID_RANGE = None
+
 app = Flask(__name__)
 
 req_counter = 0
 req_counter_lock = threading.Lock()
 
+def init(deck: str, version: int, port: int):
+    global server_model, IGNORE_BM, VALID_RANGE
+
+    model_dir = f"models/{deck}/ver{version}"
+    ignore_path = f"{model_dir}/ignore.roar"
+    model_path = f"{model_dir}/model.pt.gz"
+
+    with open(ignore_path, "rb") as f:
+        IGNORE_BM = BitMap.deserialize(f.read())
+
+    VALID_RANGE = BitMap(range(GLOBAL_MAX))
+
+    server_model = Net(GLOBAL_MAX, ACTIONS_MAX).to(DEVICE).eval()
+    ckpt = load_model(model_path)
+    server_model.load_state_dict(ckpt["model_state_dict"])
+
+    threading.Thread(target=worker_loop, daemon=True).start()
+
+    print(f"[INIT] deck={deck} ver={version} port={port} device={DEVICE}")
+    waitress.serve(app, host="127.0.0.1", port=port, threads=6)
 
 class Pending:
     __slots__ = ("idx", "off", "evt", "out", "req_id", "pre_count", "post_count", "t_recv", "t_done", "num_bags")
@@ -92,9 +101,6 @@ Q: "Queue[Pending]" = Queue(maxsize=4096)
 
 
 def worker_loop():
-    print(f"[INIT] Device={DEVICE}, torch threads={TORCH_THREADS}, "
-          f"model={MODEL}, ignore={IGNORE}")
-
     while True:
         p0 = Q.get()
         batch = [p0]
@@ -204,4 +210,11 @@ def healthz():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=50052, threaded=True)
+    import argparse
+    import waitress
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--deck", required=True)
+    parser.add_argument("--version", type=int, required=True)
+    parser.add_argument("--port", type=int, default=50052)
+    args = parser.parse_args()
+    init(args.deck, args.version, args.port)

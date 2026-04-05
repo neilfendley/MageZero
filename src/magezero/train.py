@@ -4,33 +4,57 @@ import torch
 import torch.nn.functional as F
 from torch import nn, optim
 from torch.utils.data import DataLoader
+from torch.amp import autocast, GradScaler
 import os
 import math
 import gzip
+from tqdm import tqdm
 
 
 import magezero.test as test
 from magezero.dataset import H5Indexed, collate_batch,  create_redundancy_ignore_list, filter_opponent_states
 from pyroaring import BitMap
 
-#add training data under: data/{deck name}/ver{your version num}/training/{your data}.hdf5
-DECK_NAME = "IzzetElementals"
-VER_NUMBER = 0
+def env_str(name: str, default: str) -> str:
+    return os.environ.get(name, default)
 
-MAKE_IGNORE_LIST = True
-TRAIN_OPPONENT_HEAD = False #turn off when training on round-robin data
-ACTIONS_MAX = 128
-GLOBAL_MAX = 2000000
-EPOCH_COUNT = 60
-USE_PREVIOUS_MODEL = False
+
+def env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    return int(value) if value is not None else default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+#add training data under: data/{deck name}/ver{your version num}/training/{your data}.hdf5
+DECK_NAME = env_str("MAGEZERO_DECK_NAME", "IzzetElementals")
+VER_NUMBER = env_int("MAGEZERO_VER_NUMBER", 0)
+
+MAKE_IGNORE_LIST = env_bool("MAGEZERO_MAKE_IGNORE_LIST", True)
+TRAIN_OPPONENT_HEAD = env_bool("MAGEZERO_TRAIN_OPPONENT_HEAD", False) #turn off when training on round-robin data
+ACTIONS_MAX = env_int("MAGEZERO_ACTIONS_MAX", 128)
+GLOBAL_MAX = env_int("MAGEZERO_GLOBAL_MAX", 2000000)
+EPOCH_COUNT = env_int("MAGEZERO_EPOCH_COUNT", 60)
+USE_PREVIOUS_MODEL = env_bool("MAGEZERO_USE_PREVIOUS_MODEL", False)
+USE_IGNORE = env_bool("MAGEZERO_USE_IGNORE", True)
+BATCH_SIZE = env_int("MAGEZERO_BATCH_SIZE", 128)
+EMBEDDING_DIM = env_int("MAGEZERO_EMBEDDING_DIM", 432)
+HIDDEN_DIM = env_int("MAGEZERO_HIDDEN_DIM", 216)
+USE_MIXED_PRECISION = env_bool("MAGEZERO_MIXED_PRECISION", True)
+NUM_WORKERS = env_int("MAGEZERO_NUM_WORKERS", 4)
 
 
 #TODO: wire into xmage data pipeline
 #for now just manually enter your matchup-specific action space sizes here for optimal normalization(XMage prints them at the start of each run)
-PRIORITY_A_MAX = 128
-PRIORITY_B_MAX = 128
-TARGETS_MAX = 128
-BINARY_MAX = 2
+PRIORITY_A_MAX = env_int("MAGEZERO_PRIORITY_A_MAX", 128)
+PRIORITY_B_MAX = env_int("MAGEZERO_PRIORITY_B_MAX", 128)
+TARGETS_MAX = env_int("MAGEZERO_TARGETS_MAX", 128)
+BINARY_MAX = env_int("MAGEZERO_BINARY_MAX", 2)
 
 def head_weight(K: int) -> float:
     """
@@ -47,13 +71,39 @@ lambda_pB = head_weight(PRIORITY_B_MAX)
 lambda_t = head_weight(TARGETS_MAX)
 lambda_b = head_weight(BINARY_MAX)
 
-def load_model(path):
+def load_model(path, device='cpu'):
+    """Load model checkpoint with optimized device mapping.
+    
+    Args:
+        path: Path to model file (.pt or .pt.gz)
+        device: Device to load model to (e.g., 'cpu', 'cuda')
+    """
+    import time
+    start = time.time()
+    
     if path.endswith('.gz'):
-        with gzip.open(path, 'rb') as f:
-            out = torch.load(f, map_location=torch.device('cpu'))
-            return out
+        # Pre-decompress to temporary file for faster loading
+        # import tempfile
+        # with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as tmp:
+        #     tmp_path = tmp.name
+        print("Only found compressed model, decompressing now")
+        decompressed_path = path[:-3]  # Remove .gz extension
+        if not os.path.exists(decompressed_path):
+            with gzip.open(path, 'rb') as f_in:
+                with open(decompressed_path, 'wb') as f_out:
+                    f_out.write(f_in.read())
+            print("Finished Decompressing Model")
+            out = torch.load(decompressed_path, map_location=device, weights_only=False)
+        else:
+            out = torch.load(path, map_location=device, weights_only=False)
 
-    return torch.load(path)
+        #     os.unlink(tmp_path)
+    else:
+        out = torch.load(path, map_location=device, weights_only=False)
+    
+    elapsed = time.time() - start
+    print(f'  load_model: {elapsed:.2f}s')
+    return out
 
 
 class ActionType(Enum):
@@ -76,8 +126,8 @@ class Net(nn.Module):
         super().__init__()
 
 
-        embedding_dim = 512  # Output of EmbeddingBag
-        hidden_dim_mlp = 256  # Output of the main MLP block
+        embedding_dim = EMBEDDING_DIM  # Output of EmbeddingBag
+        hidden_dim_mlp = HIDDEN_DIM  # Output of the main MLP block
         self.embedding_bag = nn.EmbeddingBag(
             num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
@@ -133,22 +183,56 @@ def normalize_policy_labels(raw: torch.Tensor) -> torch.Tensor:
     return raw / total
 
 
+def find_max_embedding_index(ds: 'H5Indexed') -> int:
+    """
+    Safely scan dataset to find the maximum embedding index used.
+    This prevents allocating memory for unused embedding slots.
+    """
+    max_idx = 0
+    for i in range(len(ds)):
+        indices, _, _, _, _ = ds[i]
+        if len(indices) > 0:
+            max_idx = max(max_idx, indices.max().item())
+    return max_idx + 1  # +1 because indices are 0-based
+
+
 def train():
     os.makedirs(f"models/{DECK_NAME}/ver{VER_NUMBER}", exist_ok=True)
     ds_raw = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training")
     print(torch.cuda.is_available())
 
+    ##Ignore handling
+    # if USE_IGNORE:
+    ignore_list_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar"
+    print(DECK_NAME, VER_NUMBER, ignore_list_path)
+    if os.path.exists(ignore_list_path):
+        print("Loading existing ignore list from ignore.roar")
+        with open(ignore_list_path, "rb") as f:
+            loaded_bitmap = BitMap.deserialize(f.read())
+        ignore_list = list(loaded_bitmap)
+    else:
+        print("Generating ignore list from dataset to use for model")
+        ignore_list = create_redundancy_ignore_list(ds_raw, k=1)
+        if not MAKE_IGNORE_LIST: ignore_list = []
+        print("Saving ignore list to ignore.roar")
 
-    #ignore handling
-    print("Generating ignore list from dataset to use for model")
-    ignore_list = create_redundancy_ignore_list(ds_raw)
+        ignore = BitMap(ignore_list)  # iterable of ints
+        with open(f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar", "wb") as f:
+            f.write(ignore.serialize())
 
     # model and data loaders
+    # Scan dataset to find actual max embedding index needed (not GLOBAL_MAX)
+    # print("Scanning dataset to determine actual embedding table size...")
+    # actual_max_idx = find_max_embedding_index(ds_raw)
+    # actual_embeddings_needed = min(actual_max_idx, GLOBAL_MAX)
+    # print(f"Dataset uses embeddings up to index {actual_max_idx - 1}. Allocating {actual_embeddings_needed} instead of {GLOBAL_MAX}.")
+    
+    print(f"Loading Model")
     model = Net(GLOBAL_MAX, ACTIONS_MAX).cuda()
 
     # optional start point
     if USE_PREVIOUS_MODEL:
-        checkpoint_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt.gz"
+        checkpoint_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt"
         try:
             #checkpoint = torch.load(checkpoint_path, map_location="cuda")
             checkpoint = load_model(checkpoint_path)
@@ -157,7 +241,7 @@ def train():
                 ignore_list2 = BitMap.deserialize(f.read())
                 ignore_list.intersection_update(ignore_list2)
                 #ignore_list = ignore_list2
-            print(f"intersected with previous ignore list: {len(ignore_list2)} for final ignore list: {len(ignore_list)} leaving {GLOBAL_MAX-len(ignore_list)} features")
+            # print(f"intersected with previous ignore list: {len(ignore_list2)} for final ignore list: {len(ignore_list)} leaving {actual_embeddings_needed-len(ignore_list)} features")
             # opt_sparse.load_state_dict(checkpoint['optimizer_sparse_state_dict'])
             # opt_dense.load_state_dict(checkpoint['optimizer_dense_state_dict'])
             print(f"Successfully loaded checkpoint from {checkpoint_path}")
@@ -166,13 +250,8 @@ def train():
         except Exception as e:
             print(f"ERROR: Could not load checkpoint. {e}. Starting from scratch.")
 
-    if not MAKE_IGNORE_LIST: ignore_list = []
-    print("Saving ignore list to ignore.roar")
-
-    ignore = BitMap(ignore_list)  # iterable of ints
-    with open(f"models/{DECK_NAME}/ver{VER_NUMBER}/ignore.roar", "wb") as f:
-        f.write(ignore.serialize())
-
+   
+    print(f"Creating training and testing data loaders with batch size {BATCH_SIZE}")
     #data sets with redundant filter
     ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training", ignore_list)
     test_ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/testing", ignore_list)
@@ -184,14 +263,13 @@ def train():
 
 
 
-    dl = DataLoader(ds, batch_size=128, shuffle=True, num_workers=0, collate_fn=collate_batch,
+    dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, collate_fn=collate_batch,
                     pin_memory=True, persistent_workers=False)
 
-    dl_test = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=0, collate_fn=collate_batch,
+    dl_test = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, collate_fn=collate_batch,
                     pin_memory=True, persistent_workers=False)
 
     test.SHOW_CONFUSION_MATRIX = False
-
     #optimizers
     opt_sparse = optim.SparseAdam(model.embedding_bag.parameters(), lr=5e-4)
     #opt_sparse = torch.optim.Adagrad(model.embedding_bag.parameters(), lr=0.1,initial_accumulator_value=0.1)
@@ -207,19 +285,21 @@ def train():
             dense_bias_params.append(p)
 
     opt_dense = optim.Adam(dense_params, lr=5e-4)
-
-
+    
+    # Mixed precision training
+    scaler = GradScaler(enabled=USE_MIXED_PRECISION)
 
     mse = nn.MSELoss()
     kld = nn.KLDivLoss(reduction='batchmean')
 
     #main training loop
+    print(f"Beginning Training loop for {EPOCH_COUNT} epochs")
     for epoch in range(1, EPOCH_COUNT+1):
         total_pA_loss, total_pB_loss, total_t_loss, total_b_loss, total_v_loss, total_l1_sparse_loss, total_l1_dense_loss = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         total_decision_examples, total_pA_examples, total_pB_examples, total_t_examples, total_b_examples = 0,0,0,0,0
         model.train()
 
-        for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in dl:
+        for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in tqdm(dl):
             # Move new input tensors to CUDA
             batch_indices = batch_indices.cuda()
             batch_offsets = batch_offsets.cuda()
@@ -228,79 +308,82 @@ def train():
             is_players = is_players.cuda().squeeze(-1).to(torch.bool)
             action_types = action_types.cuda().squeeze(-1).to(torch.long)
 
-            # Model call uses indices and offsets
-            priority_logits, opponent_priority_logits, target_logits, binary_logits ,value_pred = model(batch_indices, batch_offsets)
+            # Model call uses indices and offsets with mixed precision
+            with autocast(enabled=USE_MIXED_PRECISION, device_type="cuda"):
+                priority_logits, opponent_priority_logits, target_logits, binary_logits ,value_pred = model(batch_indices, batch_offsets)
 
 
 
-            nonzero = (batch_policy_labels > 0).sum(dim=1)  # [B]
-            decision_mask = nonzero > 1  # [B] states where more than one action is available
-            priority_mask = (action_types==ActionType.PRIORITY.value) & is_players & decision_mask
-            opponent_priority_mask = (action_types==ActionType.PRIORITY.value) & (~is_players) & decision_mask
-            target_mask = (action_types==ActionType.CHOOSE_TARGET.value) & decision_mask
-            binary_mask = (action_types==ActionType.CHOOSE_USE.value) & decision_mask
+                nonzero = (batch_policy_labels > 0).sum(dim=1)  # [B]
+                decision_mask = nonzero > 1  # [B] states where more than one action is available
+                priority_mask = (action_types==ActionType.PRIORITY.value) & is_players & decision_mask
+                opponent_priority_mask = (action_types==ActionType.PRIORITY.value) & (~is_players) & decision_mask
+                target_mask = (action_types==ActionType.CHOOSE_TARGET.value) & decision_mask
+                binary_mask = (action_types==ActionType.CHOOSE_USE.value) & decision_mask
 
 
-            total_decision_examples += decision_mask.sum().item()
+                total_decision_examples += decision_mask.sum().item()
 
-            #priority A
-            if priority_mask.any():
-                log_probs_d = F.log_softmax(priority_logits[priority_mask][:,:PRIORITY_A_MAX], dim=1)
-                tgt = normalize_policy_labels(batch_policy_labels[priority_mask][:,:PRIORITY_A_MAX])
-                lpA = kld(log_probs_d, tgt)*lambda_pA
-                s = log_probs_d.size(0)
-                total_pA_loss += lpA.item() * s
-                total_pA_examples += s
-            else:
-                lpA = torch.zeros((), device=value_pred.device)
+                #priority A
+                if priority_mask.any():
+                    log_probs_d = F.log_softmax(priority_logits[priority_mask][:,:PRIORITY_A_MAX], dim=1)
+                    tgt = normalize_policy_labels(batch_policy_labels[priority_mask][:,:PRIORITY_A_MAX])
+                    lpA = kld(log_probs_d, tgt)*lambda_pA
+                    s = log_probs_d.size(0)
+                    total_pA_loss += lpA.item() * s
+                    total_pA_examples += s
+                else:
+                    lpA = torch.zeros((), device=value_pred.device)
 
-            #priority B (this uses virtual visits)
-            if opponent_priority_mask.any():
-                log_probs_d = F.log_softmax(opponent_priority_logits[opponent_priority_mask][:,:PRIORITY_B_MAX], dim=1)
-                tgt = normalize_policy_labels(batch_policy_labels[opponent_priority_mask][:,:PRIORITY_B_MAX])
-                lpB = kld(log_probs_d, tgt)*lambda_pB
-                s = log_probs_d.size(0)
-                total_pB_loss += lpB.item() * s
-                total_pB_examples += s
-            else:
-                lpB = torch.zeros((), device=value_pred.device)
+                #priority B (this uses virtual visits)
+                if opponent_priority_mask.any():
+                    log_probs_d = F.log_softmax(opponent_priority_logits[opponent_priority_mask][:,:PRIORITY_B_MAX], dim=1)
+                    tgt = normalize_policy_labels(batch_policy_labels[opponent_priority_mask][:,:PRIORITY_B_MAX])
+                    lpB = kld(log_probs_d, tgt)*lambda_pB
+                    s = log_probs_d.size(0)
+                    total_pB_loss += lpB.item() * s
+                    total_pB_examples += s
+                else:
+                    lpB = torch.zeros((), device=value_pred.device)
 
-            #targets (shared between both players)
-            if target_mask.any():
-                log_probs_d = F.log_softmax(target_logits[target_mask][:,:TARGETS_MAX], dim=1)
-                tgt = normalize_policy_labels(batch_policy_labels[target_mask][:,:TARGETS_MAX])
-                lt = kld(log_probs_d, tgt)*lambda_t
-                s = log_probs_d.size(0)
-                total_t_loss += lt.item() * s
-                total_t_examples += s
-            else:
-                lt = torch.zeros((), device=value_pred.device)
+                #targets (shared between both players)
+                if target_mask.any():
+                    log_probs_d = F.log_softmax(target_logits[target_mask][:,:TARGETS_MAX], dim=1)
+                    tgt = normalize_policy_labels(batch_policy_labels[target_mask][:,:TARGETS_MAX])
+                    lt = kld(log_probs_d, tgt)*lambda_t
+                    s = log_probs_d.size(0)
+                    total_t_loss += lt.item() * s
+                    total_t_examples += s
+                else:
+                    lt = torch.zeros((), device=value_pred.device)
 
-            # binary (choose to use) decisions
-            if binary_mask.any():
-                log_probs_d = F.log_softmax(binary_logits[binary_mask][:,:BINARY_MAX], dim=1)
-                tgt = normalize_policy_labels(batch_policy_labels[binary_mask][:,:BINARY_MAX])
-                lb = kld(log_probs_d, tgt)*lambda_b
-                s = log_probs_d.size(0)
-                total_b_loss += lb.item() * s
-                total_b_examples += s
-            else:
-                lb = torch.zeros((), device=value_pred.device)
+                # binary (choose to use) decisions
+                if binary_mask.any():
+                    log_probs_d = F.log_softmax(binary_logits[binary_mask][:,:BINARY_MAX], dim=1)
+                    tgt = normalize_policy_labels(batch_policy_labels[binary_mask][:,:BINARY_MAX])
+                    lb = kld(log_probs_d, tgt)*lambda_b
+                    s = log_probs_d.size(0)
+                    total_b_loss += lb.item() * s
+                    total_b_examples += s
+                else:
+                    lb = torch.zeros((), device=value_pred.device)
 
-            lv = mse(value_pred, batch_value_labels.squeeze(-1))
-            l1_dense = 0
-            for param in dense_weight_params:
-                l1_dense += torch.sum(torch.abs(param))
-            l1_dense *= 1e-5
+                lv = mse(value_pred, batch_value_labels.squeeze(-1))
+                l1_dense = 0
+                for param in dense_weight_params:
+                    l1_dense += torch.sum(torch.abs(param))
+                l1_dense *= 1e-5
 
-            total_l1_dense_loss += l1_dense.item()
-            total_l1_sparse_loss += model.l1_penalty.item()
-            loss = lpA + lpB + lt + lb + lv #+ model.l1_penalty #+ l1_dense
+                total_l1_dense_loss += l1_dense.item()
+                total_l1_sparse_loss += model.l1_penalty.item()
+                loss = lpA + lpB + lt + lb + lv #+ model.l1_penalty #+ l1_dense
+            
             opt_sparse.zero_grad()
             opt_dense.zero_grad()
-            loss.backward()
-            opt_sparse.step()
-            opt_dense.step()
+            scaler.scale(loss).backward()
+            scaler.step(opt_sparse)
+            scaler.step(opt_dense)
+            scaler.update()
 
 
             total_v_loss += lv.item()
@@ -318,17 +401,17 @@ def train():
         if len(test_ds)>0:
             test.validate(model, dl_test)
         #TODO: make validation based checkpoint schedule
-        if epoch == EPOCH_COUNT:
-            checkpoint_save_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt.gz"
-            with gzip.open(checkpoint_save_path, 'wb') as f:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_sparse_state_dict': opt_sparse.state_dict(),
-                    'optimizer_dense_state_dict': opt_dense.state_dict(),
-                    'avg_p_loss': avg_pA_loss,  # Optional: save last losses
-                    'avg_v_loss': avg_v_loss,
-                }, f)
+        if epoch == EPOCH_COUNT or (epoch % 10) == 0:
+            checkpoint_save_path = f"models/{DECK_NAME}/ver{VER_NUMBER}/model.pt"
+            # with open(checkpoint_save_path, 'wb') as f:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_sparse_state_dict': opt_sparse.state_dict(),
+                'optimizer_dense_state_dict': opt_dense.state_dict(),
+                'avg_p_loss': avg_pA_loss,  # Optional: save last losses
+                'avg_v_loss': avg_v_loss,
+            }, checkpoint_save_path)
 
 if __name__ == "__main__":
     train()

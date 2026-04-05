@@ -8,26 +8,24 @@ from pyroaring import BitMap
 from flask import Flask, request, Response
 import msgpack
 
-from train import Net, GLOBAL_MAX, ACTIONS_MAX, VER_NUMBER, DECK_NAME, load_model
+try:
+    from .train import Net, GLOBAL_MAX, ACTIONS_MAX, VER_NUMBER, DECK_NAME, load_model
+except ImportError:
+    from train import Net, GLOBAL_MAX, ACTIONS_MAX, VER_NUMBER, DECK_NAME, load_model
 
 MODEL_DIR = f"models/{DECK_NAME}/ver{VER_NUMBER}"
 IGNORE = MODEL_DIR + "/ignore.roar"
-MODEL = MODEL_DIR + "/model.pt.gz"
+MODEL = MODEL_DIR + "/model.pt"
 
 # Device setup
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load ignore bitmap
-with open(IGNORE, "rb") as f:
-    IGNORE_BM = BitMap.deserialize(f.read())
-
 # Valid range bitmap for bounds checking (roaring compresses this to ~bytes)
 VALID_RANGE = BitMap(range(GLOBAL_MAX))
 
-# Load model
-server_model = Net(GLOBAL_MAX, ACTIONS_MAX).to(DEVICE).eval()
-ckpt = load_model(MODEL)
-server_model.load_state_dict(ckpt["model_state_dict"])
+model_lock = threading.RLock()
+IGNORE_BM = BitMap()
+server_model = None
 
 # Threading config
 TORCH_THREADS = max(1, os.cpu_count() // 2)
@@ -41,6 +39,33 @@ app = Flask(__name__)
 
 req_counter = 0
 req_counter_lock = threading.Lock()
+
+
+def load_server_artifacts():
+    with open(IGNORE, "rb") as f:
+        ignore_bm = BitMap.deserialize(f.read())
+
+    model = Net(GLOBAL_MAX, ACTIONS_MAX).eval()
+    print(f'Model loaded, now loading weights from {MODEL}')
+    ckpt = load_model(MODEL, device=DEVICE)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model = model.to(DEVICE)
+    print("Model weights loaded.")
+    return model, ignore_bm
+
+
+def reload_server_model():
+    global server_model, IGNORE_BM
+    print("Loading server artifacts...")
+    model, ignore_bm = load_server_artifacts()
+    print("Server model loaded.")
+
+    with model_lock:
+        server_model = model
+        IGNORE_BM = ignore_bm
+
+
+reload_server_model()
 
 
 class Pending:
@@ -133,8 +158,9 @@ def worker_loop():
             off = (all_off + adjustments).to(DEVICE, non_blocking=True)
 
         # Single forward pass
-        with torch.no_grad():
-            pA, pB, tgt, bin2, val = server_model(idx, off)
+        with model_lock:
+            with torch.no_grad():
+                pA, pB, tgt, bin2, val = server_model(idx, off)
 
         # Move to CPU once
         pA = pA.cpu()
@@ -203,5 +229,19 @@ def healthz():
     return "ok", 200
 
 
+@app.post("/reload")
+def reload_endpoint():
+    reload_server_model()
+    return {
+        "status": "reloaded",
+        "deck": DECK_NAME,
+        "version": VER_NUMBER,
+        "model": MODEL,
+        "ignore": IGNORE,
+    }, 200
+
+
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=50052, threaded=True)
+    host = os.environ.get("MAGEZERO_SERVER_HOST", "127.0.0.1")
+    port = int(os.environ.get("MAGEZERO_SERVER_PORT", "50052"))
+    app.run(host=host, port=port, threaded=True)

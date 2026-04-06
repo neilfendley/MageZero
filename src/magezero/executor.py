@@ -74,8 +74,10 @@ def post(url: str) -> None:
 def run_command(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
     print(f"[cmd] {' '.join(cmd)}", flush=True)
     print(f"[cmd] cwd={cwd}", flush=True)
-    subprocess.run(cmd, cwd=cwd, check=True, env=env,stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    # subprocess.run(cmd, cwd=cwd, check=True, env=env,stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     # subprocess.run(cmd, cwd=cwd, check=True, env=env)
+    subprocess.run(cmd, cwd=cwd, check=True, shell=True, env=env)
+
 
 
 def start_server(args: argparse.Namespace, env: dict[str, str]) -> subprocess.Popen:
@@ -155,8 +157,9 @@ def round_robin() -> None:
                 run_command(build_krenko_command(args), cwd=MAGE_ROOT,env=os.environ.copy())
             except Exception as e:
                 print(f'something failed with decks {player_deck} {opp_deck}')
+            breakpoint()
 
-def main() -> None:
+def one_deck_per_model() -> None:
     args = parse_args()
     deck_name = args.deck_name or Path(args.deck_path).stem
 

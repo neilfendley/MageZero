@@ -9,6 +9,7 @@ import os
 import math
 import gzip
 from tqdm import tqdm
+from pathlib import Path
 
 
 import magezero.test as test
@@ -46,7 +47,7 @@ BATCH_SIZE = env_int("MAGEZERO_BATCH_SIZE", 128)
 EMBEDDING_DIM = env_int("MAGEZERO_EMBEDDING_DIM", 432)
 HIDDEN_DIM = env_int("MAGEZERO_HIDDEN_DIM", 216)
 USE_MIXED_PRECISION = env_bool("MAGEZERO_MIXED_PRECISION", True)
-NUM_WORKERS = env_int("MAGEZERO_NUM_WORKERS", 4)
+NUM_WORKERS = env_int("MAGEZERO_NUM_WORKERS", 0)
 
 
 #TODO: wire into xmage data pipeline
@@ -198,7 +199,8 @@ def find_max_embedding_index(ds: 'H5Indexed') -> int:
 
 def train():
     os.makedirs(f"models/{DECK_NAME}/ver{VER_NUMBER}", exist_ok=True)
-    ds_raw = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training")
+    data_path = Path(f"data/ver{VER_NUMBER}/training")
+    ds_raw = H5Indexed(data_path, deck_name=DECK_NAME)
     print(torch.cuda.is_available())
 
     ##Ignore handling
@@ -253,13 +255,13 @@ def train():
    
     print(f"Creating training and testing data loaders with batch size {BATCH_SIZE}")
     #data sets with redundant filter
-    ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/training", ignore_list)
-    test_ds = H5Indexed(f"data/{DECK_NAME}/ver{VER_NUMBER}/testing", ignore_list)
+    ds = H5Indexed(data_path, ignore_list)
+    test_ds = H5Indexed(data_path.parent / 'test', ignore_list)
 
     #if round-robin filter out opponent states AFTER making the ignore list
-    if not TRAIN_OPPONENT_HEAD:
-        ds = filter_opponent_states(ds,TARGETS_MAX)
-        test_ds = filter_opponent_states(test_ds,TARGETS_MAX)
+    # if not TRAIN_OPPONENT_HEAD:
+    #     ds = filter_opponent_states(ds,TARGETS_MAX)
+    #     test_ds = filter_opponent_states(test_ds,TARGETS_MAX)
 
 
 

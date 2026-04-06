@@ -8,6 +8,7 @@ import sys
 from typing import Set
 from scipy.sparse import coo_matrix
 import h5py
+from tqdm import tqdm
 
 
 GLOBAL_MAX = 2000000
@@ -25,10 +26,17 @@ class H5Indexed(Dataset):
       (indices:int64[r], policy:float32[A], value:float32[1], is_player:float32[1], action_type:int64[1])
     """
 
-    def __init__(self, dir_path: str, ignore: set[int] | None = None):
+    def __init__(self, dir_path: str, ignore: set[int] | None = None, deck_name: str | None = None):
         p = Path(dir_path)
         h5_paths = sorted(list(p.glob("**/*.h5")) + list(p.glob("**/*.hdf5")))
-        self.files = [str(pp) for pp in h5_paths]
+        decks_to_use = []
+        if deck_name:
+            for path in h5_paths:
+                if path.name.split('.')[0].split('_')[0] == deck_name:
+                    decks_to_use.append(path)
+        else:
+            decks_to_use = h5_paths
+        self.files = [str(pp) for pp in decks_to_use]
         if not self.files:
             self.N = 0
             self.A = 0
@@ -114,7 +122,9 @@ class H5Indexed(Dataset):
         A = self.A
         policy_t = row_k.narrow(0, 0, A)  # float32 [A]
         value_t = row_k[A + 0].unsqueeze(0)  # float32 [1]
-        isP_t = (row_k[A + 2] > 0.5).float().unsqueeze(0)  # float32 [1]
+        ## Currently filtered by labeled state writer 
+        # isP_t = (row_k[A + 2] > 0.5).float().unsqueeze(0)  # float32 [1]
+        isP_t = torch.ones(1)
         aType_t = row_k[A + 3].to(torch.long).unsqueeze(0)  # int64 [1]
 
         return sv_idx_t, policy_t, value_t, isP_t, aType_t
@@ -155,7 +165,7 @@ def create_redundancy_ignore_list(ds, k=10) -> Set[int]:
     num_samples = 0
 
     # single pass: collect which samples contain each feature
-    for (idxs, _, _, _, _) in ds:
+    for (idxs, _, _, _, _) in tqdm(ds):
         idxs_np = idxs.cpu().numpy().astype(np.int32, copy=False)
         for feature_idx in idxs_np:
             feature_idx_int = int(feature_idx)
@@ -168,13 +178,13 @@ def create_redundancy_ignore_list(ds, k=10) -> Set[int]:
     ignore = set()
 
     # 1. features that occur less than k times
+    groups = {}
     for feature_idx, sample_set in feature_to_samples.items():
         if len(sample_set) <= k:
             ignore.add(feature_idx)
+            continue
 
-    # 2. group identical features (same sample set patterns) and keep only one from each group
-    groups = {}
-    for feature_idx, sample_set in feature_to_samples.items():
+        # 2. group identical features (same sample set patterns) and keep only one from each group
         key = tuple(sorted(sample_set))  # unique pattern of samples containing this feature
         groups.setdefault(key, []).append(feature_idx)
 

@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--player-b-output-dir", default="data/selfplay/playerB", help="Krenko output dir for player B, relative to the mage repo.")
     parser.add_argument("--train-epochs", type=int, help="Override MAGEZERO_EPOCH_COUNT for each training run.")
     parser.add_argument("--train-opponent-head", action="store_true", help="Set MAGEZERO_TRAIN_OPPONENT_HEAD=1 during training.")
+    parser.add_argument("--output-dir", default="data", help="Folder within mage to save games to")
     parser.add_argument("--python", default=sys.executable, help="Python executable to use for server and training.")
     return parser.parse_args()
 
@@ -105,6 +106,7 @@ def build_krenko_command(args: argparse.Namespace) -> list[str]:
         "--threads", str(args.threads),
         "--player-a-type", "mcts",
         "--player-b-type", "mcts",
+        "--output-dir", args.output_dir,
     ]
     exec_args_str = " ".join(exec_args)
     return [
@@ -149,7 +151,7 @@ def round_robin() -> None:
     comb = combinations(decks, 2)
     for player_deck, opp_deck in comb:
         print(f'Running KrenkoMain with player deck {player_deck} and opponent deck {opp_deck}')
-        for num_threads in [16,20,24,28]:
+        for num_threads in [2,4,8,10]:
             args.threads = num_threads
             try:
                 args.deck_path = player_deck
@@ -157,7 +159,6 @@ def round_robin() -> None:
                 run_command(build_krenko_command(args), cwd=MAGE_ROOT,env=os.environ.copy())
             except Exception as e:
                 print(f'something failed with decks {player_deck} {opp_deck}')
-            breakpoint()
 
 def one_deck_per_model() -> None:
     args = parse_args()

@@ -5,7 +5,7 @@ from torch import nn  # optim is not strictly needed for testing if not optimizi
 from torch.utils.data import DataLoader
 
 from magezero.dataset import H5Indexed, collate_batch, filter_opponent_states
-# import magezero.train
+import magezero.train as train
 
 SHOW_CONFUSION_MATRIX = True
 

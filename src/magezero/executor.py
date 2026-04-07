@@ -7,6 +7,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from tqdm import tqdm
+from itertools import combinations
 
 
 MODULE_DIR = Path(__file__).resolve().parent
@@ -23,9 +25,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deck-name", help="Deck name used under MageZero/data and MageZero/models. Defaults to the deck filename stem.")
     parser.add_argument("--version", type=int, default=0, help="MageZero model/data version number.")
     parser.add_argument("--iterations", type=int, default=1, help="Number of self-play/train cycles to run.")
-    parser.add_argument("--games-per-test", type=int, default=20, help="Games per KrenkoMain batch.")
+    parser.add_argument("--games-per-test", type=int, default=32, help="Games per KrenkoMain batch.")
     parser.add_argument("--number-of-tests", type=int, default=1, help="How many KrenkoMain batches to run per cycle.")
-    parser.add_argument("--max-turns", type=int, default=50, help="Maximum turns per game.")
+    parser.add_argument("--max-turns", type=int, default=40, help="Maximum turns per game.")
     parser.add_argument("--threads", type=int, default=20, help="XMage self-play worker thread count.")
     parser.add_argument("--server-host", default="127.0.0.1", help="Inference server host.")
     parser.add_argument("--server-port", type=int, default=50052, help="Inference server port.")
@@ -35,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--player-b-output-dir", default="data/selfplay/playerB", help="Krenko output dir for player B, relative to the mage repo.")
     parser.add_argument("--train-epochs", type=int, help="Override MAGEZERO_EPOCH_COUNT for each training run.")
     parser.add_argument("--train-opponent-head", action="store_true", help="Set MAGEZERO_TRAIN_OPPONENT_HEAD=1 during training.")
+    parser.add_argument("--output-dir", default="data", help="Folder within mage to save games to")
     parser.add_argument("--python", default=sys.executable, help="Python executable to use for server and training.")
     return parser.parse_args()
 
@@ -72,7 +75,10 @@ def post(url: str) -> None:
 def run_command(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
     print(f"[cmd] {' '.join(cmd)}", flush=True)
     print(f"[cmd] cwd={cwd}", flush=True)
+    # subprocess.run(cmd, cwd=cwd, check=True, env=env,stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    # subprocess.run(cmd, cwd=cwd, check=True, env=env)
     subprocess.run(cmd, cwd=cwd, check=True, shell=True, env=env)
+
 
 
 def start_server(args: argparse.Namespace, env: dict[str, str]) -> subprocess.Popen:
@@ -92,16 +98,15 @@ def start_server(args: argparse.Namespace, env: dict[str, str]) -> subprocess.Po
 def build_krenko_command(args: argparse.Namespace) -> list[str]:
     exec_args = [
         "--config", args.config_path,
-        "--self-play",
         "--player-deck", args.deck_path,
+        "--opponent-deck", args.opp_path,
         "--games-per-test", str(args.games_per_test),
         "--number-of-tests", str(args.number_of_tests),
         "--max-turns", str(args.max_turns),
         "--threads", str(args.threads),
         "--player-a-type", "mcts",
         "--player-b-type", "mcts",
-        "--player-a-output-dir", args.player_a_output_dir,
-        "--player-b-output-dir", args.player_b_output_dir,
+        "--output-dir", args.output_dir,
     ]
     exec_args_str = " ".join(exec_args)
     return [
@@ -132,7 +137,30 @@ def copy_new_files(new_files: list[Path], destination_root: Path, iteration: int
     return copied
 
 
-def main() -> None:
+def round_robin() -> None:
+    args = parse_args()
+    deck_name = args.deck_name or Path(args.deck_path).stem
+
+    
+    decks = ["decks/DimirMidrange.dck",
+            "decks/JeskaiControl.dck",
+            "decks/MonoGLandfall.dck",
+            "decks/MonoRAggro.dck",
+            "decks/BWBats.dck",
+            ]
+    comb = combinations(decks, 2)
+    for player_deck, opp_deck in comb:
+        print(f'Running KrenkoMain with player deck {player_deck} and opponent deck {opp_deck}')
+        for num_threads in [2,4,8,10]:
+            args.threads = num_threads
+            try:
+                args.deck_path = player_deck
+                args.opp_path = opp_deck
+                run_command(build_krenko_command(args), cwd=MAGE_ROOT,env=os.environ.copy())
+            except Exception as e:
+                print(f'something failed with decks {player_deck} {opp_deck}')
+
+def one_deck_per_model() -> None:
     args = parse_args()
     deck_name = args.deck_name or Path(args.deck_path).stem
 
@@ -140,12 +168,13 @@ def main() -> None:
     player_b_output_dir = (MAGE_ROOT / args.player_b_output_dir).resolve()
     training_dir = (MAGEZERO_ROOT / "data" / deck_name / f"ver{args.version}" / "training").resolve()
 
+
     base_env = os.environ.copy()
     base_env["PYTHONPATH"] = str(MAGEZERO_ROOT / "src") + os.pathsep + base_env.get("PYTHONPATH", "")
     base_env["MAGEZERO_DECK_NAME"] = deck_name
     base_env["MAGEZERO_VER_NUMBER"] = str(args.version)
     base_env["MAGEZERO_SERVER_HOST"] = args.server_host
-    base_env["MAGEZERO_SERVER_PORT"] = str(args.server_port)
+    base_env["MAGEZERO_SERVER_PORT"] = str(args.server_port) 
 
     train_env = base_env.copy()
     train_env["MAGEZERO_USE_PREVIOUS_MODEL"] = "1"
@@ -154,6 +183,7 @@ def main() -> None:
     if args.train_opponent_head:
         train_env["MAGEZERO_TRAIN_OPPONENT_HEAD"] = "1"
 
+    args = parse_args()
     server = start_server(args, base_env)
     try:
         wait_for_http(f"http://{args.server_host}:{args.server_port}/healthz", timeout_s=60)

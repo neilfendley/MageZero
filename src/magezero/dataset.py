@@ -36,6 +36,7 @@ class H5Indexed(Dataset):
                     decks_to_use.append(path)
         else:
             decks_to_use = h5_paths
+
         self.files = [str(pp) for pp in decks_to_use]
         if not self.files:
             self.N = 0

@@ -255,8 +255,8 @@ def train():
    
     print(f"Creating training and testing data loaders with batch size {BATCH_SIZE}")
     #data sets with redundant filter
-    ds = H5Indexed(data_path, ignore_list)
-    test_ds = H5Indexed(data_path.parent / 'test', ignore_list)
+    ds = H5Indexed(data_path, ignore_list,  deck_name=DECK_NAME)
+    test_ds = H5Indexed(data_path.parent / 'test', ignore_list, deck_name=DECK_NAME)
 
     #if round-robin filter out opponent states AFTER making the ignore list
     # if not TRAIN_OPPONENT_HEAD:

@@ -6,12 +6,12 @@ from queue import Queue, Empty
 import torch
 from pyroaring import BitMap
 from flask import Flask, request, Response
+from pathlib import Path
 import msgpack
 
-try:
-    from .train import Net, GLOBAL_MAX, ACTIONS_MAX, VER_NUMBER, DECK_NAME, load_model
-except ImportError:
-    from train import Net, GLOBAL_MAX, ACTIONS_MAX, VER_NUMBER, DECK_NAME, load_model
+
+from .train import Net, GLOBAL_MAX, ACTIONS_MAX, VER_NUMBER, DECK_NAME, load_model
+
 
 MODEL_DIR = f"models/{DECK_NAME}/ver{VER_NUMBER}"
 IGNORE = MODEL_DIR + "/ignore.roar"
@@ -28,11 +28,11 @@ IGNORE_BM = BitMap()
 server_model = None
 
 # Threading config
-TORCH_THREADS = max(1, os.cpu_count() // 2)
-torch.set_num_threads(TORCH_THREADS)
+TORCH_THREADS = os.environ.get("MAGEZERO_SERVER_THREADS", os.cpu_count() // 2)
+torch.set_num_threads(int(TORCH_THREADS))
 
 # Batching config
-MAX_BATCH = 2
+MAX_BATCH = 24
 MAX_WAIT_MS = 0
 
 app = Flask(__name__)
@@ -41,16 +41,18 @@ req_counter = 0
 req_counter_lock = threading.Lock()
 
 
-def load_server_artifacts():
+def load_server_artifacts(path=MODEL):
+
     with open(IGNORE, "rb") as f:
         ignore_bm = BitMap.deserialize(f.read())
 
     model = Net(GLOBAL_MAX, ACTIONS_MAX).eval()
-    print(f'Model loaded, now loading weights from {MODEL}')
-    ckpt = load_model(MODEL, device=DEVICE)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model = model.to(DEVICE)
-    print("Model weights loaded.")
+    print(f'Model loaded, Must load weights to use model"')
+    # ckpt = load_model(path, device='cpu')
+    # model.load_state_dict(ckpt["model_state_dict"])
+    # model = model.to(DEVICE)
+    # print("Model weights loaded.")
+    # print("Model artifacts loaded. )
     return model, ignore_bm
 
 
@@ -64,6 +66,27 @@ def reload_server_model():
         server_model = model
         IGNORE_BM = ignore_bm
 
+def load_model_weights(path_to_weights):
+    # path_to_weights = Path(path_to_weights)
+    print("Loading server artifacts...")
+    ckpt = load_model(path_to_weights, device='cpu')
+    model = Net(GLOBAL_MAX, ACTIONS_MAX).eval()
+
+    ignore_path = Path(path_to_weights).parent / "ignore.roar"
+    with open(ignore_path, "rb") as f:
+        ignore_bm = BitMap.deserialize(f.read())    
+    model.load_state_dict(ckpt["model_state_dict"])
+    model = model.to(DEVICE)
+    return model, ignore_bm
+
+def load_server_weights(path_to_weights):
+    global server_model, IGNORE_BM
+
+    model, bm = load_model_weights(path_to_weights)
+    with model_lock:
+        server_model = model
+        IGNORE_BM = bm
+    print("Server model weights reloaded.")
 
 reload_server_model()
 
@@ -240,6 +263,14 @@ def reload_endpoint():
         "ignore": IGNORE,
     }, 200
 
+@app.post("/load")
+def load_endpoint():
+    print('Received request to load new model weights')
+    path = request.json.get("path")
+    if not path:
+        return {"error": "Path is required"}, 400
+    load_server_weights(path)
+    return {"status": "loaded"}, 200
 
 if __name__ == "__main__":
     host = os.environ.get("MAGEZERO_SERVER_HOST", "127.0.0.1")

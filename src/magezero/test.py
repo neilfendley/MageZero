@@ -63,13 +63,12 @@ def validate(model, dl):
     model.eval()
     with torch.no_grad():
         for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in dl:
-            # Move new input tensors to CUDA
-            batch_indices = batch_indices.cuda()
-            batch_offsets = batch_offsets.cuda()
-            batch_policy_labels = batch_policy_labels.cuda()
-            batch_value_labels = batch_value_labels.cuda()
-            is_players = is_players.cuda().squeeze(-1).to(torch.bool)
-            action_types = action_types.cuda().squeeze(-1).to(torch.long)
+            batch_indices = batch_indices.to(train.DEVICE)
+            batch_offsets = batch_offsets.to(train.DEVICE)
+            batch_policy_labels = batch_policy_labels.to(train.DEVICE)
+            batch_value_labels = batch_value_labels.to(train.DEVICE)
+            is_players = is_players.to(train.DEVICE).squeeze(-1).to(torch.bool)
+            action_types = action_types.to(train.DEVICE).squeeze(-1).to(torch.long)
 
             # Model call uses indices and offsets
             priority_logits, opponent_priority_logits, target_logits, binary_logits, value_pred = model(batch_indices,
@@ -188,7 +187,7 @@ if __name__ == "__main__":
         ds = filter_opponent_states(ds,train.TARGETS_MAX)
 
     dl = DataLoader(ds, batch_size=128, shuffle=False, num_workers=0, collate_fn=collate_batch, pin_memory=True, persistent_workers=False)
-    model = train.Net(train.GLOBAL_MAX, train.ACTIONS_MAX).cuda()
+    model = train.Net(train.GLOBAL_MAX, train.ACTIONS_MAX).to(train.DEVICE)
     model.eval()
 
     checkpoint_path = f"models/{train.DECK_NAME}/ver{train.VER_NUMBER}/model.pt.gz"  # Make sure this is the correct checkpoint

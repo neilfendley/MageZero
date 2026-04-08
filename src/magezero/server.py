@@ -8,6 +8,7 @@ from pyroaring import BitMap
 from flask import Flask, request, Response
 from pathlib import Path
 import msgpack
+import signal
 
 
 from .train import Net, GLOBAL_MAX, ACTIONS_MAX, VER_NUMBER, DECK_NAME, load_model
@@ -81,14 +82,16 @@ def load_model_weights(path_to_weights):
 
 def load_server_weights(path_to_weights):
     global server_model, IGNORE_BM
-
+    with model_lock:
+        del server_model
+        del IGNORE_BM
     model, bm = load_model_weights(path_to_weights)
     with model_lock:
         server_model = model
         IGNORE_BM = bm
     print("Server model weights reloaded.")
 
-reload_server_model()
+# reload_server_model()
 
 
 class Pending:
@@ -250,7 +253,6 @@ def evaluate():
 @app.get("/healthz")
 def healthz():
     return "ok", 200
-
 
 @app.post("/reload")
 def reload_endpoint():

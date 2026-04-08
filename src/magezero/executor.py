@@ -124,7 +124,6 @@ def start_server(arg_server: argparse.Namespace, env: dict[str, str]) -> subproc
     print(f"[server] starting on http://{arg_server.server_host}:{arg_server.server_port}", flush=True)
     return subprocess.Popen(cmd, cwd=MAGEZERO_ROOT, env=env)
 
-
 def build_krenko_command(args: argparse.Namespace) -> list[str]:
     exec_args = [
         "--config", args.config_path,
@@ -157,12 +156,17 @@ def copy_new_files(new_files: list[Path], destination_root: Path, iteration: int
     destination_root.mkdir(parents=True, exist_ok=True)
     copied = 0
     for source in sorted(new_files):
+        source_path = Path(source)
         try:
-            relative = source.relative_to(MAGE_ROOT)
-            relative_key = "__".join(relative.parts)
+            file_and_timestamp = Path(source_path.parts[-2]) / source_path.name
+            timestamp = source.parent.name
         except ValueError:
-            relative_key = source.name
-        target = destination_root / f"iter{iteration:04d}__{relative_key}"
+            file_and_timestamp = source.name
+
+        timestamp_dir = destination_root / timestamp
+        if not timestamp_dir.exists():
+            timestamp_dir.mkdir(parents=True, exist_ok=True)
+        target = destination_root / f"{file_and_timestamp}"
         shutil.copy2(source, target)
         copied += 1
     return copied
@@ -223,6 +227,10 @@ def one_deck_per_model() -> None:
             comb = combinations(DECKS, 2)
 
             for player_deck, opp_deck in comb:
+                if iteration == 1:
+                    break
+                else:
+                    print('Running KrenkoMain with player deck {player_deck} and opponent deck {opp_deck}')
                 wait_for_http(f"http://{args.server_host}:{args.server_port}/healthz", timeout_s=60)
                 wait_for_http(f"http://{args.server_host}:{args.server_opponent_port}/healthz", timeout_s=60)
 
@@ -233,24 +241,28 @@ def one_deck_per_model() -> None:
                 wait_for_http(f"http://{args.server_host}:{args.server_opponent_port}/healthz", timeout_s=60)
                 print("[server] ready", flush=True)
                 print(f"[loop] iteration {iteration}/{args.iterations}: starting self-play", flush=True)
-                before = gather_hdf5_files(iter_output_dir)
                 args.deck_path = player_deck
                 args.opp_path = opp_deck
                 args.version = iteration
                 run_command(build_krenko_command(args), cwd=MAGE_ROOT, env=os.environ.copy())
-                after = gather_hdf5_files(iter_output_dir)
-                new_files = sorted(after - before)
-                if not new_files:
-                    raise RuntimeError("KrenkoMain completed without producing any new .hdf5 files.")
-                training_dir = (MAGEZERO_ROOT / "data" / f"ver{iteration}" / "training").resolve()
-                copied = copy_new_files(new_files, training_dir, iteration)
-                print(f"[loop] iteration {iteration}: copied {copied} training file(s) into {training_dir}", flush=True)
+            server.terminate()
+            server_opponent.terminate()
+            iter_files = gather_hdf5_files(MAGE_ROOT / iter_output_dir)
+            if not iter_files:
+                raise RuntimeError("KrenkoMain completed without producing any new .hdf5 files.")
+            training_dir = (MAGEZERO_ROOT / "data" / f"ver{iteration}" / "training").resolve()
+            copied = copy_new_files(iter_files, training_dir, iteration)
+            print(f"[loop] iteration {iteration}: copied {copied} training file(s) into {training_dir}", flush=True)
+            
             for deck in DECKS:
                 print(f"[loop] iteration {iteration}: training model", flush=True)
-                train_env["MAGEZERO_DECK_NAME"] = deck_name
-                train_env["MAGEZERO_VER_NUMBER"] = str(args.iteration)
-                run_command([args.python, "-m", "magezero.train"], cwd=MAGEZERO_ROOT, env=train_env)
-                print(f"[loop] iteration {iteration}: updating model weights", flush=True)
+                if iteration == 1 and deck == "decks/JeskaiControl.dck":
+                    print("One time skip")
+                else:
+                    train_env["MAGEZERO_DECK_NAME"] = Path(deck).stem
+                    train_env["MAGEZERO_VER_NUMBER"] = str(iteration)
+                    run_command([args.python, "-m", "magezero.train"], cwd=MAGEZERO_ROOT, env=train_env)
+                    print(f"[loop] iteration {iteration}: updating model weights", flush=True)
     
     finally:
         print("[loop] complete", flush=True)

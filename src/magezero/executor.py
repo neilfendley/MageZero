@@ -184,7 +184,7 @@ def round_robin() -> None:
             run_command(build_krenko_command(args), cwd=MAGE_ROOT,env=os.environ.copy())
         except Exception as e:
             print(f'something failed with decks {player_deck} {opp_deck}')
-        break
+    
         
 def one_deck_per_model() -> None:
     args = parse_args()

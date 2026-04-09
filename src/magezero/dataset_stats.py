@@ -12,7 +12,7 @@ from model import Net, load_model, GLOBAL_MAX, ACTIONS_MAX, PRIORITY_A_MAX, PRIO
 
 
 
-SHOW_PLOTS = True           # headless? set False
+SHOW_PLOTS = False          # headless? set False
 SAVE_PLOTS = True           # save PNGs to OUT_DIR
 TOP_K = 50                  # show first K bars for each head
 HIST_BINS = 21              # value histogram bins

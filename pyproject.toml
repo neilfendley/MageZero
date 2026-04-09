@@ -1,0 +1,10 @@
+[project]
+name = "magezero"
+version = "0.1.0"
+requires-python = ">=3.10"
+
+[project.scripts]
+mz = "magezero.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -13,11 +13,21 @@ dependencies = [
     "scipy>=1.10",
     "waitress>=2.1",
     "tqdm>=4.67.3",
+    "pyyaml>=6.0",
 ]
 
 [build-system]
 requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
 
 [project.scripts]
 train = "magezero.executor:train_cli"

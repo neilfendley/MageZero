@@ -216,7 +216,9 @@ def train():
         print("Loading existing ignore list from ignore.roar")
         with open(ignore_list_path, "rb") as f:
             loaded_bitmap = BitMap.deserialize(f.read())
-        ignore_list = list(loaded_bitmap)
+        # Use a set so the USE_PREVIOUS_MODEL path can call .intersection_update();
+        # downstream H5Indexed accepts set[int] anyway.
+        ignore_list = set(loaded_bitmap)
     else:
         print("Generating ignore list from dataset to use for model")
         ignore_list = create_redundancy_ignore_list(ds_raw, k=1)
@@ -302,12 +304,12 @@ def train():
 
     #main training loop
     print(f"Beginning Training loop for {EPOCH_COUNT} epochs")
-    for epoch in range(1, EPOCH_COUNT+1):
+    for epoch in tqdm(range(1, EPOCH_COUNT+1), desc="epochs", unit="epoch", position=0):
         total_pA_loss, total_pB_loss, total_t_loss, total_b_loss, total_v_loss, total_l1_sparse_loss, total_l1_dense_loss = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         total_decision_examples, total_pA_examples, total_pB_examples, total_t_examples, total_b_examples = 0,0,0,0,0
         model.train()
 
-        for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in tqdm(dl):
+        for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in tqdm(dl, desc=f"epoch {epoch}", leave=False, position=1):
             batch_indices = batch_indices.to(DEVICE)
             batch_offsets = batch_offsets.to(DEVICE)
             batch_policy_labels = batch_policy_labels.to(DEVICE)

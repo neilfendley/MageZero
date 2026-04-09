@@ -5,11 +5,13 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 from itertools import combinations
 
 logger = logging.getLogger(__name__)
@@ -62,11 +64,95 @@ def parse_args() -> argparse.Namespace:
 
 
 def gather_hdf5_files(*roots: Path) -> set[Path]:
+    """Find every `.hdf5` or `.h5` file under the given roots.
+
+    H5Indexed accepts both extensions, so the auto-increment and overwrite
+    guards in this module need to too — otherwise a slot containing only
+    `.h5` shards looks empty.
+    """
     files = set()
     for root in roots:
         if root.exists():
             files.update(path.resolve() for path in root.rglob("*.hdf5"))
+            files.update(path.resolve() for path in root.rglob("*.h5"))
     return files
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Same env-var truthiness rules as `train.env_bool`."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_krenko_server_endpoints(config_path: Path) -> tuple[str, int, int]:
+    """Read host/port/opponent_port from a Krenko YAML config so the Python
+    inference server starts on the same address Krenko is configured to talk to.
+
+    Falls back to the hardcoded defaults if the file is missing, unparseable,
+    or omits the keys.
+    """
+    default_host = "127.0.0.1"
+    default_port = 50052
+    default_opponent_port = 50053
+    if not config_path.exists():
+        logger.debug("Krenko config %s not found; using default server endpoints", config_path)
+        return default_host, default_port, default_opponent_port
+    try:
+        import yaml
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception as exc:
+        logger.warning("Failed to parse %s (%s); using default server endpoints", config_path, exc)
+        return default_host, default_port, default_opponent_port
+    server = (cfg.get("server") or {}) if isinstance(cfg, dict) else {}
+    host = server.get("host", default_host)
+    if host == "localhost":
+        host = "127.0.0.1"
+    try:
+        port = int(server.get("port", default_port))
+    except (TypeError, ValueError):
+        port = default_port
+    try:
+        opponent_port = int(server.get("opponent_port", default_opponent_port))
+    except (TypeError, ValueError):
+        opponent_port = default_opponent_port
+    return host, port, opponent_port
+
+
+def _latest_model_below(deck: str, version: int) -> Path | None:
+    """Return the highest-numbered model.pt for `deck` at a version strictly below `version`."""
+    for n in range(version - 1, -1, -1):
+        candidate = MAGEZERO_ROOT / "models" / deck / f"ver{n}" / "model.pt"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _watch_hdf5_progress(
+    watch_dir: Path,
+    baseline: set[Path],
+    total: int,
+    stop_event: threading.Event,
+    interval: float = 2.0,
+) -> None:
+    """Background poller: updates a tqdm bar as new hdf5 files appear in watch_dir."""
+    bar = tqdm(total=total, unit="file", desc="self-play", dynamic_ncols=True)
+    last = 0
+    try:
+        while not stop_event.is_set():
+            current = len(gather_hdf5_files(watch_dir) - baseline)
+            if current > last:
+                bar.update(current - last)
+                last = current
+            stop_event.wait(interval)
+        # Final flush after stop.
+        current = len(gather_hdf5_files(watch_dir) - baseline)
+        if current > last:
+            bar.update(current - last)
+    finally:
+        bar.close()
 
 
 def wait_for_http(url: str, timeout_s: float = 60.0) -> None:
@@ -300,7 +386,10 @@ def generate_data() -> None:
                         help="Opponent deck path. Omit for a mirror match.")
     parser.add_argument("--opponent-name", default=None,
                         help="Opponent deck name. Defaults to opponent-deck filename stem.")
-    parser.add_argument("--version", type=int, default=0, help="Model/data version number.")
+    parser.add_argument("--version", type=int, default=None, help="Model/data version number (default 0).")
+    parser.add_argument("--auto-increment", action="store_true",
+                        help="Pick the lowest version number where data/ver{N}/training/ has no .hdf5/.h5 files yet. "
+                             "Mutually exclusive with --version.")
     parser.add_argument("--games", type=int, default=18, help="Number of self-play games to generate.")
     parser.add_argument("--threads", type=int, default=8, help="XMage worker thread count.")
     parser.add_argument("--max-turns", type=int, default=40, help="Maximum turns per game.")
@@ -313,36 +402,71 @@ def generate_data() -> None:
     parser.add_argument("--offline", action="store_true",
                         help="Force offline mode (no inference server, even if a model exists).")
     parser.add_argument("--external-server", action="store_true",
-                        help="Don't start the inference server; assume one is already running.")
-    parser.add_argument("--server-host", default="127.0.0.1")
-    parser.add_argument("--server-port", type=int, default=50052)
-    parser.add_argument("--server-opponent-port", type=int, default=50053)
-    parser.add_argument("--server-threads", type=int, default=6)
+                        help="Don't start the inference server; assume one is already running. "
+                             "KrenkoMain still reads host/port from its YAML config.")
+    parser.add_argument("--server-threads", type=int, default=6,
+                        help="Waitress thread count for the Python inference server.")
     parser.add_argument("--python", default=sys.executable)
     args = parser.parse_args()
     _setup_logging()
+
+    # Read host/port from the same Krenko YAML config that Java will use, so
+    # both sides stay in sync no matter how the user customizes the config.
+    krenko_config_abs = (MAGE_ROOT / args.config_path).resolve()
+    SERVER_HOST, SERVER_PORT, SERVER_OPPONENT_PORT = _load_krenko_server_endpoints(krenko_config_abs)
+
+    if args.auto_increment and args.version is not None:
+        logger.error("--auto-increment cannot be combined with --version.")
+        sys.exit(1)
+
+    if args.auto_increment:
+        next_version = 0
+        while True:
+            candidate = MAGEZERO_ROOT / "data" / f"ver{next_version}" / "training"
+            if not gather_hdf5_files(candidate):
+                break
+            next_version += 1
+        args.version = next_version
+        logger.info("--auto-increment selected version %d", args.version)
+    elif args.version is None:
+        args.version = 0
 
     deck_name = args.deck_name or Path(args.deck_path).stem
     is_mirror = args.opponent_deck is None
     opp_deck_path = args.opponent_deck or args.deck_path
     opp_deck_name = args.opponent_name or Path(opp_deck_path).stem
 
-    player_model = MAGEZERO_ROOT / "models" / deck_name / f"ver{args.version}" / "model.pt"
-    opp_model = MAGEZERO_ROOT / "models" / opp_deck_name / f"ver{args.version}" / "model.pt"
+    # Use the most recent model strictly below this version (AlphaZero-style:
+    # data at ver{N} is generated using the model trained at ver{N-1} or earlier).
+    player_model = _latest_model_below(deck_name, args.version)
+    opp_model = None if is_mirror else _latest_model_below(opp_deck_name, args.version)
 
     if args.offline:
         online = False
         logger.info("Mode: offline (forced via --offline)")
-    elif not player_model.exists():
+    elif player_model is None:
         online = False
-        logger.info("Mode: offline (no model at %s)", player_model)
-    elif not is_mirror and not opp_model.exists():
+        logger.info("Mode: offline (no trained model below ver%d for deck %s)", args.version, deck_name)
+    elif not is_mirror and opp_model is None:
         online = False
-        logger.info("Mode: offline (no opponent model at %s)", opp_model)
+        logger.info("Mode: offline (no trained model below ver%d for deck %s)", args.version, opp_deck_name)
     else:
         online = True
-        logger.info("Mode: online")
+        if is_mirror:
+            logger.info("Mode: online (model=%s)", player_model)
+        else:
+            logger.info("Mode: online (player=%s, opponent=%s)", player_model, opp_model)
     logger.info("Player deck: %s, opponent deck: %s, mirror: %s", deck_name, opp_deck_name, is_mirror)
+
+    if args.dest_dir:
+        dest_preview = Path(args.dest_dir).resolve()
+    else:
+        dest_preview = (MAGEZERO_ROOT / "data" / f"ver{args.version}" / "training").resolve()
+    if gather_hdf5_files(dest_preview):
+        logger.warning(
+            "Destination %s already contains .hdf5/.h5 files; new data will be added alongside them.",
+            dest_preview,
+        )
 
     krenko_args = argparse.Namespace(
         deck_path=args.deck_path,
@@ -365,16 +489,16 @@ def generate_data() -> None:
             player_env["MAGEZERO_SERVER_THREADS"] = str(args.server_threads)
             player_server_args = argparse.Namespace(
                 python=args.python,
-                server_host=args.server_host,
-                server_port=args.server_port,
+                server_host=SERVER_HOST,
+                server_port=SERVER_PORT,
             )
             servers.append(start_server(player_server_args, player_env))
-            wait_for_http(f"http://{args.server_host}:{args.server_port}/healthz", timeout_s=60)
+            wait_for_http(f"http://{SERVER_HOST}:{SERVER_PORT}/healthz", timeout_s=60)
             update_model_weights(
-                f"http://{args.server_host}:{args.server_port}/load",
+                f"http://{SERVER_HOST}:{SERVER_PORT}/load",
                 str(player_model),
             )
-            logger.info("Player inference server ready on :%d", args.server_port)
+            logger.info("Player inference server ready on :%d", SERVER_PORT)
 
             if not is_mirror:
                 opp_env = os.environ.copy()
@@ -383,16 +507,16 @@ def generate_data() -> None:
                 opp_env["MAGEZERO_SERVER_THREADS"] = str(args.server_threads)
                 opp_server_args = argparse.Namespace(
                     python=args.python,
-                    server_host=args.server_host,
-                    server_port=args.server_opponent_port,
+                    server_host=SERVER_HOST,
+                    server_port=SERVER_OPPONENT_PORT,
                 )
                 servers.append(start_server(opp_server_args, opp_env))
-                wait_for_http(f"http://{args.server_host}:{args.server_opponent_port}/healthz", timeout_s=60)
+                wait_for_http(f"http://{SERVER_HOST}:{SERVER_OPPONENT_PORT}/healthz", timeout_s=60)
                 update_model_weights(
-                    f"http://{args.server_host}:{args.server_opponent_port}/load",
+                    f"http://{SERVER_HOST}:{SERVER_OPPONENT_PORT}/load",
                     str(opp_model),
                 )
-                logger.info("Opponent inference server ready on :%d", args.server_opponent_port)
+                logger.info("Opponent inference server ready on :%d", SERVER_OPPONENT_PORT)
         elif online and args.external_server:
             logger.info("Using external inference server (skipping startup)")
 
@@ -403,7 +527,19 @@ def generate_data() -> None:
         mage_iter_dir = MAGE_ROOT / args.mage_output_dir / f"ver{args.version}"
         existing = gather_hdf5_files(mage_iter_dir)
 
-        run_command(build_krenko_command(krenko_args), cwd=MAGE_ROOT, env=os.environ.copy())
+        stop_event = threading.Event()
+        watcher = threading.Thread(
+            target=_watch_hdf5_progress,
+            args=(mage_iter_dir, existing, args.games, stop_event),
+            daemon=True,
+        )
+        with logging_redirect_tqdm():
+            watcher.start()
+            try:
+                run_command(build_krenko_command(krenko_args), cwd=MAGE_ROOT, env=os.environ.copy())
+            finally:
+                stop_event.set()
+                watcher.join(timeout=5)
 
         new_files = sorted(gather_hdf5_files(mage_iter_dir) - existing)
         if not new_files:
@@ -446,13 +582,32 @@ def train_cli() -> None:
                         help="Set MAGEZERO_USE_PREVIOUS_MODEL=1.")
     parser.add_argument("--train-opponent-head", action="store_true",
                         help="Set MAGEZERO_TRAIN_OPPONENT_HEAD=1.")
+    parser.add_argument("--force", action="store_true",
+                        help="Overwrite an existing model checkpoint at the target version.")
+    parser.add_argument("--auto-increment", action="store_true",
+                        help="Pick the lowest version number where no model.pt exists yet. "
+                             "Mutually exclusive with --version. Combine with --use-previous-model "
+                             "to init the new version from the latest existing checkpoint.")
     args = parser.parse_args()
     _setup_logging()
 
+    if args.auto_increment and args.version is not None:
+        logger.error("--auto-increment cannot be combined with --version.")
+        sys.exit(1)
+
     if args.deck_name is not None:
         os.environ["MAGEZERO_DECK_NAME"] = args.deck_name
-    if args.version is not None:
+
+    if args.auto_increment:
+        deck = os.environ.get("MAGEZERO_DECK_NAME", "IzzetElementals")
+        next_version = 0
+        while (MAGEZERO_ROOT / "models" / deck / f"ver{next_version}" / "model.pt").exists():
+            next_version += 1
+        logger.info("--auto-increment selected version %d for deck %s", next_version, deck)
+        os.environ["MAGEZERO_VER_NUMBER"] = str(next_version)
+    elif args.version is not None:
         os.environ["MAGEZERO_VER_NUMBER"] = str(args.version)
+
     if args.epochs is not None:
         os.environ["MAGEZERO_EPOCH_COUNT"] = str(args.epochs)
     if args.batch_size is not None:
@@ -461,6 +616,67 @@ def train_cli() -> None:
         os.environ["MAGEZERO_USE_PREVIOUS_MODEL"] = "1"
     if args.train_opponent_head:
         os.environ["MAGEZERO_TRAIN_OPPONENT_HEAD"] = "1"
+
+    # Resolve effective deck/version the same way train.py does. We also resolve
+    # the effective use-previous-model flag from BOTH the CLI arg and the env
+    # var, since train.py reads MAGEZERO_USE_PREVIOUS_MODEL on its own — without
+    # this, env-only invocations like `MAGEZERO_USE_PREVIOUS_MODEL=1 uv run train`
+    # would trip the overwrite guard and skip the walkback.
+    eff_deck = os.environ.get("MAGEZERO_DECK_NAME", "IzzetElementals")
+    eff_version = os.environ.get("MAGEZERO_VER_NUMBER", "0")
+    eff_use_previous = args.use_previous_model or _env_bool("MAGEZERO_USE_PREVIOUS_MODEL")
+    model_path = MAGEZERO_ROOT / "models" / eff_deck / f"ver{eff_version}" / "model.pt"
+    if model_path.exists() and not args.force and not eff_use_previous:
+        logger.error(
+            "Refusing to overwrite existing model at %s. "
+            "Bump --version, pass --use-previous-model to fine-tune in place, "
+            "or pass --force to overwrite.",
+            model_path,
+        )
+        sys.exit(1)
+
+    # Make sure there's actually training data BEFORE we mutate anything in
+    # the target model dir — otherwise --use-previous-model below would stage
+    # a checkpoint into a version slot that we then refuse to train, leaving
+    # poisoned files behind. H5Indexed accepts both .h5 and .hdf5, so we do too.
+    data_dir = MAGEZERO_ROOT / "data" / f"ver{eff_version}" / "training"
+    matching = (
+        [p for p in (*data_dir.rglob("*.hdf5"), *data_dir.rglob("*.h5"))
+         if p.name.split('.')[0].split('_')[0] == eff_deck]
+        if data_dir.exists() else []
+    )
+    if not matching:
+        logger.error(
+            "No training data found for deck %s at %s. "
+            "Run `uv run generate-data --deck-path decks/%s.dck --version %s` first.",
+            eff_deck, data_dir, eff_deck, eff_version,
+        )
+        sys.exit(1)
+
+    # --use-previous-model: train.py only knows how to resume from the
+    # same-version path. If that file doesn't exist (the AlphaZero loop case),
+    # find the most recent earlier checkpoint and stage it into the target
+    # directory so train.py picks it up via its existing logic.
+    if eff_use_previous and not model_path.exists():
+        prev_model = _latest_model_below(eff_deck, int(eff_version))
+        if prev_model is None:
+            logger.warning(
+                "--use-previous-model set but no earlier checkpoint exists for deck %s; "
+                "training will start from scratch.",
+                eff_deck,
+            )
+        else:
+            prev_ignore = prev_model.parent / "ignore.roar"
+            if not prev_ignore.exists():
+                logger.warning(
+                    "Found %s but no matching ignore.roar; training will start from scratch.",
+                    prev_model,
+                )
+            else:
+                model_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(prev_model, model_path)
+                shutil.copy2(prev_ignore, model_path.parent / "ignore.roar")
+                logger.info("Initialized ver%s from %s", eff_version, prev_model.parent)
 
     # Lazy import: train.py reads MAGEZERO_* env vars at module load, so the
     # import has to happen *after* we've set them above.

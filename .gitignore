@@ -16,3 +16,5 @@ ignore.roar
 *.pyc
 /.idea
 /stats_out
+*.egg-info/
+.venv/

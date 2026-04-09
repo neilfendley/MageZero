@@ -1,4 +1,5 @@
 import argparse
+import logging
 from math import comb
 import os
 import shutil
@@ -10,6 +11,18 @@ import urllib.request
 from pathlib import Path
 from tqdm import tqdm
 from itertools import combinations
+
+logger = logging.getLogger(__name__)
+
+
+def _setup_logging() -> None:
+    level_name = os.environ.get("MAGEZERO_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
 
 
 MODULE_DIR = Path(__file__).resolve().parent
@@ -273,6 +286,187 @@ def one_deck_per_model() -> None:
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait(timeout=15)
+
+def generate_data() -> None:
+    """Run a single batch of self-play data generation, optionally backed by a model server."""
+    parser = argparse.ArgumentParser(
+        description="Generate MTG self-play training data via XMage KrenkoMain."
+    )
+    parser.add_argument("--deck-path", required=True,
+                        help="Player deck path relative to the mage repo (e.g. decks/IzzetElementals.dck).")
+    parser.add_argument("--deck-name", default=None,
+                        help="Deck name used for model lookup. Defaults to deck-path filename stem.")
+    parser.add_argument("--opponent-deck", default=None,
+                        help="Opponent deck path. Omit for a mirror match.")
+    parser.add_argument("--opponent-name", default=None,
+                        help="Opponent deck name. Defaults to opponent-deck filename stem.")
+    parser.add_argument("--version", type=int, default=0, help="Model/data version number.")
+    parser.add_argument("--games", type=int, default=18, help="Number of self-play games to generate.")
+    parser.add_argument("--threads", type=int, default=8, help="XMage worker thread count.")
+    parser.add_argument("--max-turns", type=int, default=40, help="Maximum turns per game.")
+    parser.add_argument("--config-path", default="Mage.MageZero/config/krenko_config.yml",
+                        help="KrenkoMain config path relative to the mage repo.")
+    parser.add_argument("--mage-output-dir", default="data",
+                        help="Folder within the mage repo where XMage writes HDF5 files.")
+    parser.add_argument("--dest-dir", default=None,
+                        help="Destination dir under MageZero. Defaults to data/ver{N}/training.")
+    parser.add_argument("--offline", action="store_true",
+                        help="Force offline mode (no inference server, even if a model exists).")
+    parser.add_argument("--external-server", action="store_true",
+                        help="Don't start the inference server; assume one is already running.")
+    parser.add_argument("--server-host", default="127.0.0.1")
+    parser.add_argument("--server-port", type=int, default=50052)
+    parser.add_argument("--server-opponent-port", type=int, default=50053)
+    parser.add_argument("--server-threads", type=int, default=6)
+    parser.add_argument("--python", default=sys.executable)
+    args = parser.parse_args()
+    _setup_logging()
+
+    deck_name = args.deck_name or Path(args.deck_path).stem
+    is_mirror = args.opponent_deck is None
+    opp_deck_path = args.opponent_deck or args.deck_path
+    opp_deck_name = args.opponent_name or Path(opp_deck_path).stem
+
+    player_model = MAGEZERO_ROOT / "models" / deck_name / f"ver{args.version}" / "model.pt"
+    opp_model = MAGEZERO_ROOT / "models" / opp_deck_name / f"ver{args.version}" / "model.pt"
+
+    if args.offline:
+        online = False
+        logger.info("Mode: offline (forced via --offline)")
+    elif not player_model.exists():
+        online = False
+        logger.info("Mode: offline (no model at %s)", player_model)
+    elif not is_mirror and not opp_model.exists():
+        online = False
+        logger.info("Mode: offline (no opponent model at %s)", opp_model)
+    else:
+        online = True
+        logger.info("Mode: online")
+    logger.info("Player deck: %s, opponent deck: %s, mirror: %s", deck_name, opp_deck_name, is_mirror)
+
+    krenko_args = argparse.Namespace(
+        deck_path=args.deck_path,
+        opp_path=opp_deck_path,
+        config_path=args.config_path,
+        games_per_test=args.games,
+        number_of_tests=1,
+        max_turns=args.max_turns,
+        threads=args.threads,
+        output_dir=args.mage_output_dir,
+        version=args.version,
+    )
+
+    servers: list[subprocess.Popen] = []
+    try:
+        if online and not args.external_server:
+            player_env = os.environ.copy()
+            player_env["MAGEZERO_DECK_NAME"] = deck_name
+            player_env["MAGEZERO_VER_NUMBER"] = str(args.version)
+            player_env["MAGEZERO_SERVER_THREADS"] = str(args.server_threads)
+            player_server_args = argparse.Namespace(
+                python=args.python,
+                server_host=args.server_host,
+                server_port=args.server_port,
+            )
+            servers.append(start_server(player_server_args, player_env))
+            wait_for_http(f"http://{args.server_host}:{args.server_port}/healthz", timeout_s=60)
+            update_model_weights(
+                f"http://{args.server_host}:{args.server_port}/load",
+                str(player_model),
+            )
+            logger.info("Player inference server ready on :%d", args.server_port)
+
+            if not is_mirror:
+                opp_env = os.environ.copy()
+                opp_env["MAGEZERO_DECK_NAME"] = opp_deck_name
+                opp_env["MAGEZERO_VER_NUMBER"] = str(args.version)
+                opp_env["MAGEZERO_SERVER_THREADS"] = str(args.server_threads)
+                opp_server_args = argparse.Namespace(
+                    python=args.python,
+                    server_host=args.server_host,
+                    server_port=args.server_opponent_port,
+                )
+                servers.append(start_server(opp_server_args, opp_env))
+                wait_for_http(f"http://{args.server_host}:{args.server_opponent_port}/healthz", timeout_s=60)
+                update_model_weights(
+                    f"http://{args.server_host}:{args.server_opponent_port}/load",
+                    str(opp_model),
+                )
+                logger.info("Opponent inference server ready on :%d", args.server_opponent_port)
+        elif online and args.external_server:
+            logger.info("Using external inference server (skipping startup)")
+
+        logger.info("Running KrenkoMain with player deck %s and opponent deck %s",
+                    args.deck_path, opp_deck_path)
+
+        # Snapshot existing files so we copy only what's new this run.
+        mage_iter_dir = MAGE_ROOT / args.mage_output_dir / f"ver{args.version}"
+        existing = gather_hdf5_files(mage_iter_dir)
+
+        run_command(build_krenko_command(krenko_args), cwd=MAGE_ROOT, env=os.environ.copy())
+
+        new_files = sorted(gather_hdf5_files(mage_iter_dir) - existing)
+        if not new_files:
+            logger.warning("KrenkoMain produced no new .hdf5 files")
+            return
+
+        if args.dest_dir:
+            dest = Path(args.dest_dir).resolve()
+        else:
+            dest = (MAGEZERO_ROOT / "data" / f"ver{args.version}" / "training").resolve()
+        copied = copy_new_files(new_files, dest, args.version)
+        logger.info("Copied %d HDF5 file(s) into %s", copied, dest)
+
+    finally:
+        for srv in servers:
+            srv.terminate()
+        for srv in servers:
+            try:
+                srv.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                srv.kill()
+                srv.wait(timeout=15)
+
+
+def train_cli() -> None:
+    """CLI wrapper around magezero.train.train that exposes common params as flags.
+
+    Flags translate to MAGEZERO_* env vars before train.py is imported, so the
+    module-level constants in train.py pick them up. Omitted flags fall through
+    to the existing env-var defaults.
+    """
+    parser = argparse.ArgumentParser(
+        description="Train a MageZero model on collected HDF5 data."
+    )
+    parser.add_argument("--deck-name", default=None, help="Override MAGEZERO_DECK_NAME.")
+    parser.add_argument("--version", type=int, default=None, help="Override MAGEZERO_VER_NUMBER.")
+    parser.add_argument("--epochs", type=int, default=None, help="Override MAGEZERO_EPOCH_COUNT.")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override MAGEZERO_BATCH_SIZE.")
+    parser.add_argument("--use-previous-model", action="store_true",
+                        help="Set MAGEZERO_USE_PREVIOUS_MODEL=1.")
+    parser.add_argument("--train-opponent-head", action="store_true",
+                        help="Set MAGEZERO_TRAIN_OPPONENT_HEAD=1.")
+    args = parser.parse_args()
+    _setup_logging()
+
+    if args.deck_name is not None:
+        os.environ["MAGEZERO_DECK_NAME"] = args.deck_name
+    if args.version is not None:
+        os.environ["MAGEZERO_VER_NUMBER"] = str(args.version)
+    if args.epochs is not None:
+        os.environ["MAGEZERO_EPOCH_COUNT"] = str(args.epochs)
+    if args.batch_size is not None:
+        os.environ["MAGEZERO_BATCH_SIZE"] = str(args.batch_size)
+    if args.use_previous_model:
+        os.environ["MAGEZERO_USE_PREVIOUS_MODEL"] = "1"
+    if args.train_opponent_head:
+        os.environ["MAGEZERO_TRAIN_OPPONENT_HEAD"] = "1"
+
+    # Lazy import: train.py reads MAGEZERO_* env vars at module load, so the
+    # import has to happen *after* we've set them above.
+    from magezero.train import train as run_train
+    run_train()
+
 
 if __name__ == "__main__":
     main()

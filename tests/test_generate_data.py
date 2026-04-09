@@ -11,21 +11,7 @@ import pytest
 
 from magezero import executor
 
-
-def _stage_model(magezero_root: Path, deck: str, version: int) -> Path:
-    p = magezero_root / "models" / deck / f"ver{version}" / "model.pt"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(b"")
-    (p.parent / "ignore.roar").write_bytes(b"")
-    return p
-
-
-def _stage_existing_data(magezero_root: Path, version: int) -> Path:
-    d = magezero_root / "data" / f"ver{version}" / "training"
-    d.mkdir(parents=True, exist_ok=True)
-    f = d / "old.hdf5"
-    f.write_bytes(b"")
-    return f
+from tests.conftest import stage_model, stage_training_shard
 
 
 @pytest.fixture
@@ -105,8 +91,8 @@ def test_auto_increment_skips_populated_versions(
     monkeypatch: pytest.MonkeyPatch,
     mock_subprocess: dict,
 ) -> None:
-    _stage_existing_data(fake_workspace, 0)
-    _stage_existing_data(fake_workspace, 1)
+    stage_training_shard(fake_workspace, 0)
+    stage_training_shard(fake_workspace, 1)
     monkeypatch.setattr(sys, "argv", ["generate-data", "--deck-path", "decks/X.dck", "--auto-increment"])
     executor.generate_data()
     # The picked version should be 2 — we can verify by inspecting the krenko
@@ -156,7 +142,7 @@ def test_online_when_earlier_model_exists(
     monkeypatch: pytest.MonkeyPatch,
     mock_subprocess: dict,
 ) -> None:
-    _stage_model(fake_workspace, "X", 0)
+    stage_model(fake_workspace, "X", 0)
     monkeypatch.setattr(
         sys, "argv",
         ["generate-data", "--deck-path", "decks/X.dck", "--version", "1"],
@@ -174,7 +160,7 @@ def test_offline_flag_forces_offline_even_with_model(
     monkeypatch: pytest.MonkeyPatch,
     mock_subprocess: dict,
 ) -> None:
-    _stage_model(fake_workspace, "X", 0)
+    stage_model(fake_workspace, "X", 0)
     monkeypatch.setattr(
         sys, "argv",
         ["generate-data", "--deck-path", "decks/X.dck", "--version", "1", "--offline"],
@@ -188,8 +174,8 @@ def test_asymmetric_starts_two_servers_when_both_models_exist(
     monkeypatch: pytest.MonkeyPatch,
     mock_subprocess: dict,
 ) -> None:
-    _stage_model(fake_workspace, "X", 0)
-    _stage_model(fake_workspace, "Y", 0)
+    stage_model(fake_workspace, "X", 0)
+    stage_model(fake_workspace, "Y", 0)
     monkeypatch.setattr(
         sys, "argv",
         [

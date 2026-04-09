@@ -7,6 +7,8 @@ import pytest
 
 from magezero import executor
 
+from tests.conftest import stage_model
+
 
 # ---------------------------------------------------------------------------
 # _load_krenko_server_endpoints
@@ -65,40 +67,33 @@ def test_load_endpoints_no_server_section(tmp_path: Path) -> None:
 # _latest_model_below
 # ---------------------------------------------------------------------------
 
-def _stage_model(magezero_root: Path, deck: str, version: int) -> Path:
-    p = magezero_root / "models" / deck / f"ver{version}" / "model.pt"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(b"")
-    return p
-
-
 def test_latest_model_below_no_models_returns_none(fake_workspace: Path) -> None:
     assert executor._latest_model_below("X", 5) is None
 
 
 def test_latest_model_below_returns_immediately_below(fake_workspace: Path) -> None:
-    _stage_model(fake_workspace, "X", 0)
-    _stage_model(fake_workspace, "X", 1)
+    stage_model(fake_workspace, "X", 0)
+    stage_model(fake_workspace, "X", 1)
     result = executor._latest_model_below("X", 2)
     assert result is not None
     assert result.parent.name == "ver1"
 
 
 def test_latest_model_below_tolerates_gaps(fake_workspace: Path) -> None:
-    _stage_model(fake_workspace, "X", 0)
-    _stage_model(fake_workspace, "X", 3)  # gap at 1, 2
+    stage_model(fake_workspace, "X", 0)
+    stage_model(fake_workspace, "X", 3)  # gap at 1, 2
     result = executor._latest_model_below("X", 5)
     assert result is not None
     assert result.parent.name == "ver3"
 
 
 def test_latest_model_below_version_zero_returns_none(fake_workspace: Path) -> None:
-    _stage_model(fake_workspace, "X", 0)  # exists, but we ask for "below 0"
+    stage_model(fake_workspace, "X", 0)  # exists, but we ask for "below 0"
     assert executor._latest_model_below("X", 0) is None
 
 
 def test_latest_model_below_filters_by_deck(fake_workspace: Path) -> None:
-    _stage_model(fake_workspace, "OtherDeck", 5)
+    stage_model(fake_workspace, "OtherDeck", 5)
     assert executor._latest_model_below("X", 10) is None
 
 

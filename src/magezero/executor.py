@@ -130,6 +130,33 @@ def _latest_model_below(deck: str, version: int) -> Path | None:
     return None
 
 
+def _start_inference_server_for(
+    args: argparse.Namespace,
+    deck_name: str,
+    server_host: str,
+    server_port: int,
+    model_path: Path,
+) -> subprocess.Popen:
+    """Start a Python inference server bound to `server_port` and load
+    `model_path` into it. Used for both the player and (in asymmetric mode)
+    the opponent server. Returns the live `Popen` so the caller can tear it
+    down on exit.
+    """
+    env = os.environ.copy()
+    env["MAGEZERO_DECK_NAME"] = deck_name
+    env["MAGEZERO_VER_NUMBER"] = str(args.version)
+    env["MAGEZERO_SERVER_THREADS"] = str(args.server_threads)
+    server_args = argparse.Namespace(
+        python=args.python,
+        server_host=server_host,
+        server_port=server_port,
+    )
+    proc = start_server(server_args, env)
+    wait_for_http(f"http://{server_host}:{server_port}/healthz", timeout_s=60)
+    update_model_weights(f"http://{server_host}:{server_port}/load", str(model_path))
+    return proc
+
+
 def _watch_hdf5_progress(
     watch_dir: Path,
     baseline: set[Path],
@@ -137,7 +164,7 @@ def _watch_hdf5_progress(
     stop_event: threading.Event,
     interval: float = 2.0,
 ) -> None:
-    """Background poller: updates a tqdm bar as new hdf5 files appear in watch_dir."""
+    """Background poller: updates a tqdm bar as new .hdf5/.h5 files appear in watch_dir."""
     bar = tqdm(total=total, unit="file", desc="self-play", dynamic_ncols=True)
     last = 0
     try:
@@ -413,7 +440,7 @@ def generate_data() -> None:
     # Read host/port from the same Krenko YAML config that Java will use, so
     # both sides stay in sync no matter how the user customizes the config.
     krenko_config_abs = (MAGE_ROOT / args.config_path).resolve()
-    SERVER_HOST, SERVER_PORT, SERVER_OPPONENT_PORT = _load_krenko_server_endpoints(krenko_config_abs)
+    server_host, server_port, server_opponent_port = _load_krenko_server_endpoints(krenko_config_abs)
 
     if args.auto_increment and args.version is not None:
         logger.error("--auto-increment cannot be combined with --version.")
@@ -459,13 +486,13 @@ def generate_data() -> None:
     logger.info("Player deck: %s, opponent deck: %s, mirror: %s", deck_name, opp_deck_name, is_mirror)
 
     if args.dest_dir:
-        dest_preview = Path(args.dest_dir).resolve()
+        dest = Path(args.dest_dir).resolve()
     else:
-        dest_preview = (MAGEZERO_ROOT / "data" / f"ver{args.version}" / "training").resolve()
-    if gather_hdf5_files(dest_preview):
+        dest = (MAGEZERO_ROOT / "data" / f"ver{args.version}" / "training").resolve()
+    if gather_hdf5_files(dest):
         logger.warning(
             "Destination %s already contains .hdf5/.h5 files; new data will be added alongside them.",
-            dest_preview,
+            dest,
         )
 
     krenko_args = argparse.Namespace(
@@ -483,40 +510,15 @@ def generate_data() -> None:
     servers: list[subprocess.Popen] = []
     try:
         if online and not args.external_server:
-            player_env = os.environ.copy()
-            player_env["MAGEZERO_DECK_NAME"] = deck_name
-            player_env["MAGEZERO_VER_NUMBER"] = str(args.version)
-            player_env["MAGEZERO_SERVER_THREADS"] = str(args.server_threads)
-            player_server_args = argparse.Namespace(
-                python=args.python,
-                server_host=SERVER_HOST,
-                server_port=SERVER_PORT,
-            )
-            servers.append(start_server(player_server_args, player_env))
-            wait_for_http(f"http://{SERVER_HOST}:{SERVER_PORT}/healthz", timeout_s=60)
-            update_model_weights(
-                f"http://{SERVER_HOST}:{SERVER_PORT}/load",
-                str(player_model),
-            )
-            logger.info("Player inference server ready on :%d", SERVER_PORT)
-
+            servers.append(_start_inference_server_for(
+                args, deck_name, server_host, server_port, player_model,
+            ))
+            logger.info("Player inference server ready on :%d", server_port)
             if not is_mirror:
-                opp_env = os.environ.copy()
-                opp_env["MAGEZERO_DECK_NAME"] = opp_deck_name
-                opp_env["MAGEZERO_VER_NUMBER"] = str(args.version)
-                opp_env["MAGEZERO_SERVER_THREADS"] = str(args.server_threads)
-                opp_server_args = argparse.Namespace(
-                    python=args.python,
-                    server_host=SERVER_HOST,
-                    server_port=SERVER_OPPONENT_PORT,
-                )
-                servers.append(start_server(opp_server_args, opp_env))
-                wait_for_http(f"http://{SERVER_HOST}:{SERVER_OPPONENT_PORT}/healthz", timeout_s=60)
-                update_model_weights(
-                    f"http://{SERVER_HOST}:{SERVER_OPPONENT_PORT}/load",
-                    str(opp_model),
-                )
-                logger.info("Opponent inference server ready on :%d", SERVER_OPPONENT_PORT)
+                servers.append(_start_inference_server_for(
+                    args, opp_deck_name, server_host, server_opponent_port, opp_model,
+                ))
+                logger.info("Opponent inference server ready on :%d", server_opponent_port)
         elif online and args.external_server:
             logger.info("Using external inference server (skipping startup)")
 
@@ -543,15 +545,11 @@ def generate_data() -> None:
 
         new_files = sorted(gather_hdf5_files(mage_iter_dir) - existing)
         if not new_files:
-            logger.warning("KrenkoMain produced no new .hdf5 files")
+            logger.warning("KrenkoMain produced no new .hdf5/.h5 files")
             return
 
-        if args.dest_dir:
-            dest = Path(args.dest_dir).resolve()
-        else:
-            dest = (MAGEZERO_ROOT / "data" / f"ver{args.version}" / "training").resolve()
         copied = copy_new_files(new_files, dest, args.version)
-        logger.info("Copied %d HDF5 file(s) into %s", copied, dest)
+        logger.info("Copied %d data file(s) into %s", copied, dest)
 
     finally:
         for srv in servers:
@@ -638,13 +636,12 @@ def train_cli() -> None:
     # Make sure there's actually training data BEFORE we mutate anything in
     # the target model dir — otherwise --use-previous-model below would stage
     # a checkpoint into a version slot that we then refuse to train, leaving
-    # poisoned files behind. H5Indexed accepts both .h5 and .hdf5, so we do too.
+    # poisoned files behind.
     data_dir = MAGEZERO_ROOT / "data" / f"ver{eff_version}" / "training"
-    matching = (
-        [p for p in (*data_dir.rglob("*.hdf5"), *data_dir.rglob("*.h5"))
-         if p.name.split('.')[0].split('_')[0] == eff_deck]
-        if data_dir.exists() else []
-    )
+    matching = [
+        p for p in gather_hdf5_files(data_dir)
+        if p.name.split('.')[0].split('_')[0] == eff_deck
+    ]
     if not matching:
         logger.error(
             "No training data found for deck %s at %s. "

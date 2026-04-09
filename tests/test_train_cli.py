@@ -11,23 +11,7 @@ import pytest
 
 from magezero import executor
 
-
-def _stage_data(magezero_root: Path, version: int, deck: str, ext: str = "hdf5") -> Path:
-    """Create a fake training shard so the data preflight passes."""
-    d = magezero_root / "data" / f"ver{version}" / "training"
-    d.mkdir(parents=True, exist_ok=True)
-    f = d / f"{deck}_v{version}.{ext}"
-    f.write_bytes(b"")
-    return f
-
-
-def _stage_model(magezero_root: Path, deck: str, version: int, with_ignore: bool = True) -> Path:
-    p = magezero_root / "models" / deck / f"ver{version}" / "model.pt"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(b"weights")
-    if with_ignore:
-        (p.parent / "ignore.roar").write_bytes(b"ignore")
-    return p
+from tests.conftest import stage_model, stage_training_shard
 
 
 # ---------------------------------------------------------------------------
@@ -50,8 +34,8 @@ def test_auto_increment_and_use_previous_model_now_compose(
 ) -> None:
     """Regression test for the codex finding: --auto-increment + --use-previous-model
     used to be rejected. They should now compose to enable the AlphaZero loop."""
-    _stage_model(fake_workspace, "X", 0)
-    _stage_data(fake_workspace, 1, "X")
+    stage_model(fake_workspace, "X", 0)
+    stage_training_shard(fake_workspace, 1, "X")
     monkeypatch.setattr(sys, "argv", ["train", "--deck-name", "X", "--auto-increment", "--use-previous-model"])
     executor.train_cli()
     assert fake_train_module["called"] == 1
@@ -80,7 +64,7 @@ def test_train_accepts_h5_extension(
 ) -> None:
     """Regression test: H5Indexed accepts both .h5 and .hdf5, so the preflight
     should too."""
-    _stage_data(fake_workspace, 0, "X", ext="h5")
+    stage_training_shard(fake_workspace, 0, "X", ext="h5")
     monkeypatch.setattr(sys, "argv", ["train", "--deck-name", "X", "--version", "0"])
     executor.train_cli()
     assert fake_train_module["called"] == 1
@@ -90,7 +74,7 @@ def test_train_filters_data_by_deck_prefix(
     fake_workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A shard for a different deck shouldn't satisfy the preflight for this deck."""
-    _stage_data(fake_workspace, 0, "OtherDeck")
+    stage_training_shard(fake_workspace, 0, "OtherDeck")
     monkeypatch.setattr(sys, "argv", ["train", "--deck-name", "X", "--version", "0"])
     with pytest.raises(SystemExit) as exc:
         executor.train_cli()
@@ -104,8 +88,8 @@ def test_train_filters_data_by_deck_prefix(
 def test_train_refuses_to_overwrite_existing_model(
     fake_workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _stage_data(fake_workspace, 0, "X")
-    _stage_model(fake_workspace, "X", 0)
+    stage_training_shard(fake_workspace, 0, "X")
+    stage_model(fake_workspace, "X", 0)
     monkeypatch.setattr(sys, "argv", ["train", "--deck-name", "X", "--version", "0"])
     with pytest.raises(SystemExit) as exc:
         executor.train_cli()
@@ -117,8 +101,8 @@ def test_train_force_allows_overwrite(
     monkeypatch: pytest.MonkeyPatch,
     fake_train_module: dict,
 ) -> None:
-    _stage_data(fake_workspace, 0, "X")
-    _stage_model(fake_workspace, "X", 0)
+    stage_training_shard(fake_workspace, 0, "X")
+    stage_model(fake_workspace, "X", 0)
     monkeypatch.setattr(sys, "argv", ["train", "--deck-name", "X", "--version", "0", "--force"])
     executor.train_cli()
     assert fake_train_module["called"] == 1
@@ -129,8 +113,8 @@ def test_train_use_previous_model_exempts_from_overwrite_check(
     monkeypatch: pytest.MonkeyPatch,
     fake_train_module: dict,
 ) -> None:
-    _stage_data(fake_workspace, 0, "X")
-    _stage_model(fake_workspace, "X", 0)
+    stage_training_shard(fake_workspace, 0, "X")
+    stage_model(fake_workspace, "X", 0)
     monkeypatch.setattr(sys, "argv", ["train", "--deck-name", "X", "--version", "0", "--use-previous-model"])
     executor.train_cli()
     assert fake_train_module["called"] == 1
@@ -145,7 +129,7 @@ def test_use_previous_model_does_not_stage_files_when_data_missing(
 ) -> None:
     """If the data preflight is going to fail, --use-previous-model must NOT
     leave a staged checkpoint behind in the target version's model dir."""
-    _stage_model(fake_workspace, "X", 0)
+    stage_model(fake_workspace, "X", 0)
     # No data at ver1.
     monkeypatch.setattr(sys, "argv", ["train", "--deck-name", "X", "--version", "1", "--use-previous-model"])
     with pytest.raises(SystemExit) as exc:
@@ -164,7 +148,7 @@ def test_auto_increment_picks_zero_when_no_models(
     monkeypatch: pytest.MonkeyPatch,
     fake_train_module: dict,
 ) -> None:
-    _stage_data(fake_workspace, 0, "X")
+    stage_training_shard(fake_workspace, 0, "X")
     monkeypatch.setattr(sys, "argv", ["train", "--deck-name", "X", "--auto-increment"])
     executor.train_cli()
     assert fake_train_module["called"] == 1
@@ -175,9 +159,9 @@ def test_auto_increment_skips_existing_models(
     monkeypatch: pytest.MonkeyPatch,
     fake_train_module: dict,
 ) -> None:
-    _stage_model(fake_workspace, "X", 0)
-    _stage_model(fake_workspace, "X", 1)
-    _stage_data(fake_workspace, 2, "X")
+    stage_model(fake_workspace, "X", 0)
+    stage_model(fake_workspace, "X", 1)
+    stage_training_shard(fake_workspace, 2, "X")
     monkeypatch.setattr(sys, "argv", ["train", "--deck-name", "X", "--auto-increment"])
     executor.train_cli()
     assert fake_train_module["called"] == 1
@@ -194,8 +178,8 @@ def test_env_var_use_previous_model_exempts_from_overwrite_check(
 ) -> None:
     """Regression: setting MAGEZERO_USE_PREVIOUS_MODEL=1 should be equivalent
     to passing --use-previous-model on the CLI for guard purposes."""
-    _stage_data(fake_workspace, 0, "X")
-    _stage_model(fake_workspace, "X", 0)
+    stage_training_shard(fake_workspace, 0, "X")
+    stage_model(fake_workspace, "X", 0)
     monkeypatch.setenv("MAGEZERO_USE_PREVIOUS_MODEL", "1")
     monkeypatch.setattr(sys, "argv", ["train", "--deck-name", "X", "--version", "0"])
     executor.train_cli()
@@ -209,8 +193,8 @@ def test_env_var_use_previous_model_triggers_walkback(
 ) -> None:
     """Regression: env-only --use-previous-model should also stage the previous
     version's checkpoint into the target dir."""
-    _stage_model(fake_workspace, "X", 0)
-    _stage_data(fake_workspace, 1, "X")
+    stage_model(fake_workspace, "X", 0)
+    stage_training_shard(fake_workspace, 1, "X")
     monkeypatch.setenv("MAGEZERO_USE_PREVIOUS_MODEL", "1")
     monkeypatch.setattr(sys, "argv", ["train", "--deck-name", "X", "--version", "1"])
     executor.train_cli()

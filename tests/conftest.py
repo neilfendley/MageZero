@@ -62,6 +62,41 @@ def reset_executor_logging(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(executor, "_setup_logging", lambda: None)
 
 
+def stage_model(
+    magezero_root: Path,
+    deck: str,
+    version: int,
+    *,
+    content: bytes = b"weights",
+    with_ignore: bool = True,
+) -> Path:
+    """Create a fake `models/{deck}/ver{N}/model.pt` (and optionally an
+    `ignore.roar`) inside the test workspace. Returns the model path.
+    """
+    p = magezero_root / "models" / deck / f"ver{version}" / "model.pt"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(content)
+    if with_ignore:
+        (p.parent / "ignore.roar").write_bytes(b"ignore")
+    return p
+
+
+def stage_training_shard(
+    magezero_root: Path,
+    version: int,
+    deck: str = "X",
+    ext: str = "hdf5",
+) -> Path:
+    """Create a fake training shard at `data/ver{N}/training/{deck}_v{N}.{ext}`
+    so the data preflight passes. Returns the file path.
+    """
+    d = magezero_root / "data" / f"ver{version}" / "training"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{deck}_v{version}.{ext}"
+    f.write_bytes(b"")
+    return f
+
+
 @pytest.fixture(autouse=True)
 def isolate_magezero_env() -> None:
     """`train_cli` and `generate_data` mutate `os.environ` directly (e.g.

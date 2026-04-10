@@ -17,3 +17,4 @@ ignore.roar
 /.venv/
 FeatureTable.txt
 /db
+*.ser

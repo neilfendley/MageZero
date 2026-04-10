@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -45,7 +46,6 @@ TMP_GAME_YML = ".mz_tmp/game.yml"
 RUNS_DIR = Path("runs")
 SRC = "src/magezero"
 PYTHON = sys.executable
-SERVER_WARMUP_SEC = 5
 EPOCHS_BOOTSTRAP = 50
 EPOCHS_ONLINE = 10
 
@@ -67,25 +67,31 @@ def next_session_id(deck: str) -> int:
     return sid
 
 
-# ─── run files (history + active state) ──────────────────────
+# ─── run folders (history + active state) ───────────────────
 
 def find_active_run(deck: str, version: int) -> Optional[Path]:
     if not RUNS_DIR.exists():
         return None
-    for f in sorted(RUNS_DIR.glob("*.json")):
-        data = json.loads(f.read_text())
+    for d in sorted(RUNS_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        json_file = d / "run.json"
+        if not json_file.exists():
+            continue
+        data = json.loads(json_file.read_text())
         if (data.get("completed_at") is None
                 and data.get("abandoned_at") is None
                 and data["primary"]["deck"] == deck
                 and data["primary"]["version"] == version):
-            return f
+            return d
     return None
 
 
-def create_run_file(run: RunConfig) -> Path:
+def create_run_dir(run: RunConfig) -> Path:
     RUNS_DIR.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    path = RUNS_DIR / f"{timestamp}.json"
+    run_dir = RUNS_DIR / timestamp
+    run_dir.mkdir()
     data = {
         "started_at": datetime.now().isoformat(),
         "completed_at": None,
@@ -105,20 +111,22 @@ def create_run_file(run: RunConfig) -> Path:
         "stage": "init",
         "gens": {},
     }
-    path.write_text(json.dumps(data, indent=2))
-    return path
+    (run_dir / "run.json").write_text(json.dumps(data, indent=2))
+    return run_dir
 
 
-def update_run(path: Path, **fields) -> dict:
-    data = json.loads(path.read_text())
+def update_run(run_dir: Path, **fields) -> dict:
+    json_file = run_dir / "run.json"
+    data = json.loads(json_file.read_text())
     data.update(fields)
-    path.write_text(json.dumps(data, indent=2))
+    json_file.write_text(json.dumps(data, indent=2))
     return data
 
 
-def record_gen(path: Path, gen: int, settings: GenSettings,
+def record_gen(run_dir: Path, gen: int, settings: GenSettings,
                primary_sessions: dict, opponent_sessions: dict) -> None:
-    data = json.loads(path.read_text())
+    json_file = run_dir / "run.json"
+    data = json.loads(json_file.read_text())
     data["gens"][str(gen)] = {
         "primary_sessions": primary_sessions,
         "opponent_sessions": opponent_sessions,
@@ -134,7 +142,7 @@ def record_gen(path: Path, gen: int, settings: GenSettings,
         },
         "completed_at": datetime.now().isoformat(),
     }
-    path.write_text(json.dumps(data, indent=2))
+    json_file.write_text(json.dumps(data, indent=2))
 
 
 # ─── version helpers ─────────────────────────────────────────
@@ -200,9 +208,11 @@ def build_game_yml(base_path: str, settings: GenSettings, run: RunConfig,
     with open(base_path) as f:
         cfg = yaml.safe_load(f)
 
+    decks_dir = Path("xmage/decks").resolve()
+
     pa = cfg["player_a"]
-    pa["deckPath"] = f"xmage/decks/{run.deck}.dck"
-    pa["output_file"] = str(primary_out)
+    pa["deckPath"] = str(decks_dir / f"{run.deck}.dck")
+    pa["output_file"] = str(primary_out.resolve())
     pa["mcts"]["offline_mode"] = primary_offline
     pa["mcts"]["td_discount"] = settings.td_discount
     pa["priors"]["prior_temperature"] = settings.prior_temperature
@@ -212,8 +222,8 @@ def build_game_yml(base_path: str, settings: GenSettings, run: RunConfig,
     pa["priors"]["opponent"] = settings.priors.opponent
 
     pb = cfg["player_b"]
-    pb["deckPath"] = f"xmage/decks/{opp.deck}.dck"
-    pb["output_file"] = str(opponent_out)
+    pb["deckPath"] = str(decks_dir / f"{opp.deck}.dck")
+    pb["output_file"] = str(opponent_out.resolve())
     pb["type"] = "minimax" if opp.mode == "minimax" else "mcts"
     pb["mcts"]["offline_mode"] = opp_offline
 
@@ -230,17 +240,26 @@ def build_game_yml(base_path: str, settings: GenSettings, run: RunConfig,
 
 # ─── subprocess wrappers ─────────────────────────────────────
 
-def start_server(deck: str, version: int, port: int) -> subprocess.Popen:
+def start_server(deck: str, version: int, port: int, run_dir: Path) -> subprocess.Popen:
     print(f"[server] start {deck} v{version} on :{port}")
-    proc = subprocess.Popen([
-        PYTHON, f"{SRC}/server.py",
-        "--deck", deck, "--version", str(version), "--port", str(port),
-    ])
-    import urllib.request
+    log_path = run_dir / f"server_{port}.log"
+    log_file = open(log_path, "a")
+    log_file.write(f"\n=== START {datetime.now().isoformat()} deck={deck} v{version} ===\n")
+    log_file.flush()
+
+    proc = subprocess.Popen(
+        [PYTHON, f"{SRC}/server.py",
+         "--deck", deck, "--version", str(version), "--port", str(port)],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    proc._mz_log_file = log_file
+
     deadline = time.time() + 600
     while time.time() < deadline:
         if proc.poll() is not None:
-            raise RuntimeError(f"server process exited before becoming ready")
+            log_file.close()
+            raise RuntimeError("server process exited before becoming ready")
         try:
             urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=1)
             print(f"[server] ready on :{port}")
@@ -248,6 +267,7 @@ def start_server(deck: str, version: int, port: int) -> subprocess.Popen:
         except Exception:
             time.sleep(0.5)
     proc.terminate()
+    log_file.close()
     raise TimeoutError(f"server on :{port} did not come up within 600s")
 
 
@@ -257,6 +277,8 @@ def stop_server(proc: subprocess.Popen) -> None:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
+    if hasattr(proc, "_mz_log_file"):
+        proc._mz_log_file.close()
 
 
 def launch_jvm(game_yml_path: str) -> None:
@@ -267,28 +289,42 @@ def launch_jvm(game_yml_path: str) -> None:
     )
 
 
-def run_train(deck: str, version: int, epochs: int, use_checkpoint: bool) -> None:
+def run_train(deck: str, version: int, epochs: int, use_checkpoint: bool,
+              run_dir: Path, gen: int) -> None:
     cmd = [PYTHON, f"{SRC}/train.py",
            "--deck", deck, "--version", str(version),
            "--epochs", str(epochs)]
     if use_checkpoint:
         cmd.append("--checkpoint")
-    subprocess.run(cmd, check=True)
+    log_path = run_dir / "train.log"
+    with open(log_path, "a") as f:
+        f.write(f"\n=== GEN {gen} TRAIN {datetime.now().isoformat()} ===\n")
+        f.flush()
+        subprocess.run(cmd, check=True, stdout=f, stderr=subprocess.STDOUT)
 
 
-def run_test(deck: str, version: int) -> None:
-    subprocess.run(
-        [PYTHON, f"{SRC}/test.py", "--deck", deck, "--version", str(version)],
-        check=True,
-    )
+def run_test(deck: str, version: int, run_dir: Path, gen: int) -> None:
+    log_path = run_dir / "test.log"
+    with open(log_path, "a") as f:
+        f.write(f"\n=== GEN {gen} TEST {datetime.now().isoformat()} ===\n")
+        f.flush()
+        subprocess.run(
+            [PYTHON, f"{SRC}/test.py", "--deck", deck, "--version", str(version)],
+            check=True, stdout=f, stderr=subprocess.STDOUT,
+        )
 
 
-def run_dataset_stats(deck: str, version: int, split: str) -> None:
-    subprocess.run(
-        [PYTHON, f"{SRC}/dataset_stats.py",
-         "--deck", deck, "--version", str(version), "--split", split],
-        check=True,
-    )
+def run_dataset_stats(deck: str, version: int, split: str,
+                      run_dir: Path, gen: int) -> None:
+    log_path = run_dir / "dataset_stats.log"
+    with open(log_path, "a") as f:
+        f.write(f"\n=== GEN {gen} DATASET_STATS {datetime.now().isoformat()} ===\n")
+        f.flush()
+        subprocess.run(
+            [PYTHON, f"{SRC}/dataset_stats.py",
+             "--deck", deck, "--version", str(version), "--split", split],
+            check=True, stdout=f, stderr=subprocess.STDOUT,
+        )
 
 
 # ─── data movement ───────────────────────────────────────────
@@ -348,23 +384,23 @@ def run_pipeline(run: RunConfig, curriculum: CurriculumConfig,
     if active:
         ans = input(f"Active run found: {active.name}. Resume? [Y/n] ").strip().lower()
         if ans in ("", "y", "yes"):
-            run_file = active
-            start_gen = json.loads(active.read_text())["current_gen"]
+            run_dir = active
+            start_gen = json.loads((active / "run.json").read_text())["current_gen"]
             print(f"Resuming from gen {start_gen}")
         else:
             update_run(active, abandoned_at=datetime.now().isoformat())
             copy_starting_checkpoint(run)
-            run_file = create_run_file(run)
+            run_dir = create_run_dir(run)
             start_gen = 0
     else:
         copy_starting_checkpoint(run)
-        run_file = create_run_file(run)
+        run_dir = create_run_dir(run)
         start_gen = 0
 
     # ── gen loop ──
     for gen in range(start_gen, run.generations):
         print(f"\n========== GEN {gen} ==========")
-        update_run(run_file, current_gen=gen, stage="generate")
+        update_run(run_dir, current_gen=gen, stage="generate")
         settings = resolve_gen(curriculum, gen)
         bootstrap = not has_checkpoint(run.deck, run.version)
 
@@ -394,9 +430,9 @@ def run_pipeline(run: RunConfig, curriculum: CurriculumConfig,
 
             servers = []
             if not primary_offline:
-                servers.append(start_server(run.deck, run.version, PRIMARY_PORT))
+                servers.append(start_server(run.deck, run.version, PRIMARY_PORT, run_dir))
             if opp.mode == "mcts" and not opp_offline:
-                servers.append(start_server(opp.deck, opp_ver, OPPONENT_PORT))
+                servers.append(start_server(opp.deck, opp_ver, OPPONENT_PORT, run_dir))
 
             try:
                 launch_jvm(game_yml)
@@ -409,21 +445,21 @@ def run_pipeline(run: RunConfig, curriculum: CurriculumConfig,
 
         # ── analyze new data ──
         if run.training.analyze_dataset:
-            update_run(run_file, stage="analyze")
-            run_dataset_stats(run.deck, run.version, "testing")
+            update_run(run_dir, stage="analyze")
+            run_dataset_stats(run.deck, run.version, "testing", run_dir, gen)
 
         # ── eval previous model on new data ──
         if run.training.eval_previous_model and gen > 0:
-            update_run(run_file, stage="eval")
-            run_test(run.deck, run.version)
+            update_run(run_dir, stage="eval")
+            run_test(run.deck, run.version, run_dir, gen)
 
         # ── move testing → training ──
-        update_run(run_file, stage="move")
+        update_run(run_dir, stage="move")
         move_testing_to_training(run.deck, run.version)
 
         # ── archive out-of-window data ──
-        update_run(run_file, stage="train")
-        data = json.loads(run_file.read_text())
+        update_run(run_dir, stage="train")
+        data = json.loads((run_dir / "run.json").read_text())
         provisional = dict(data["gens"])
         provisional[str(gen)] = {"primary_sessions": primary_sessions}
         archived = archive_out_of_window(
@@ -433,14 +469,15 @@ def run_pipeline(run: RunConfig, curriculum: CurriculumConfig,
         # ── train ──
         try:
             epochs = EPOCHS_BOOTSTRAP if bootstrap else EPOCHS_ONLINE
-            run_train(run.deck, run.version, epochs, use_checkpoint=not bootstrap)
+            run_train(run.deck, run.version, epochs, use_checkpoint=not bootstrap,
+                      run_dir=run_dir, gen=gen)
         finally:
             restore_from_archive(run.deck, run.version, archived)
 
-        record_gen(run_file, gen, settings, primary_sessions, opponent_sessions)
+        record_gen(run_dir, gen, settings, primary_sessions, opponent_sessions)
 
-    update_run(run_file, completed_at=datetime.now().isoformat(), stage="done")
-    print(f"\n✓ Run complete: {run_file.name}")
+    update_run(run_dir, completed_at=datetime.now().isoformat(), stage="done")
+    print(f"\n✓ Run complete: {run_dir.name}")
 
 
 if __name__ == "__main__":

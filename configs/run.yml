@@ -2,11 +2,11 @@
 
 deck: Standard-MonoB
 version: 1
-start_from_version: null     # null = offline bootstrap, set to resume from checkpoint
+start_from_version: 1     # null = offline bootstrap, set to resume from checkpoint
 
 generations: 2
-games_per_gen: 20
-replay_buffer_gens: 3
+games_per_gen: 100
+replay_buffer_gens: 10
 
 opponents:
   - deck: Standard-MonoR

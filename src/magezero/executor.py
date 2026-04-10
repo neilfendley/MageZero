@@ -250,6 +250,9 @@ def start_server(arg_server: argparse.Namespace, env: dict[str, str]) -> subproc
     print(f"[server] starting on http://{arg_server.server_host}:{arg_server.server_port}", flush=True)
     return subprocess.Popen(cmd, cwd=MAGEZERO_ROOT, env=env)
 
+KRENKO_JAR = os.environ.get("KRENKO_JAR")
+
+
 def build_krenko_command(args: argparse.Namespace) -> list[str]:
     exec_args = [
         "--config", args.config_path,
@@ -264,13 +267,17 @@ def build_krenko_command(args: argparse.Namespace) -> list[str]:
         "--output-dir", args.output_dir,
         "--version", str(args.version),
     ]
+    if KRENKO_JAR:
+        return [
+            "java",
+            "--enable-native-access=ALL-UNNAMED",
+            "-jar", KRENKO_JAR,
+        ] + exec_args
     exec_args_str = " ".join(exec_args)
     return [
         "mvn",
         "-pl",
         "Mage.Tests",
-        # "-am",
-        # "test-compile",
         "exec:java",
         "-Dexec.classpathScope=test",
         "-Dexec.mainClass=org.mage.test.AI.KrenkoMain",

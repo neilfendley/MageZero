@@ -68,13 +68,14 @@ def main() -> None:
         sys.exit(1)
 
     s3 = boto3.client("s3")
-    files = list(data_dir.glob("*.hdf5")) + list(data_dir.glob("*.h5"))
+    files = list(data_dir.rglob("*.hdf5")) + list(data_dir.rglob("*.h5"))
     if not files:
         print("[batch] No .hdf5/.h5 files to upload", file=sys.stderr)
         sys.exit(1)
 
     for f in sorted(files):
-        key = f"{s3_prefix}/ver{version}/training/{f.name}"
+        rel = f.relative_to(data_dir)
+        key = f"{s3_prefix}/ver{version}/training/{rel}"
         print(f"[batch] Uploading {f.name} -> s3://{s3_bucket}/{key}", flush=True)
         s3.upload_file(str(f), s3_bucket, key)
 

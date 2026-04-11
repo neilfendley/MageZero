@@ -10,8 +10,6 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from tqdm import tqdm
-from tqdm.contrib.logging import logging_redirect_tqdm
 from itertools import combinations
 
 logger = logging.getLogger(__name__)
@@ -164,22 +162,17 @@ def _watch_hdf5_progress(
     stop_event: threading.Event,
     interval: float = 2.0,
 ) -> None:
-    """Background poller: updates a tqdm bar as new .hdf5/.h5 files appear in watch_dir."""
-    bar = tqdm(total=total, unit="file", desc="self-play", dynamic_ncols=True)
+    """Background poller: logs as new .hdf5/.h5 files appear in watch_dir."""
     last = 0
-    try:
-        while not stop_event.is_set():
-            current = len(gather_hdf5_files(watch_dir) - baseline)
-            if current > last:
-                bar.update(current - last)
-                last = current
-            stop_event.wait(interval)
-        # Final flush after stop.
+    while not stop_event.is_set():
         current = len(gather_hdf5_files(watch_dir) - baseline)
         if current > last:
-            bar.update(current - last)
-    finally:
-        bar.close()
+            logger.info("self-play progress: %d/%d files", current, total)
+            last = current
+        stop_event.wait(interval)
+    current = len(gather_hdf5_files(watch_dir) - baseline)
+    if current > last:
+        logger.info("self-play progress: %d/%d files", current, total)
 
 
 def wait_for_http(url: str, timeout_s: float = 60.0) -> None:
@@ -250,7 +243,7 @@ def start_server(arg_server: argparse.Namespace, env: dict[str, str]) -> subproc
     print(f"[server] starting on http://{arg_server.server_host}:{arg_server.server_port}", flush=True)
     return subprocess.Popen(cmd, cwd=MAGEZERO_ROOT, env=env)
 
-KRENKO_JAR = os.environ.get("KRENKO_JAR")
+KRENKO_JAR = os.environ.get("KRENKO_JAR", str(MAGE_ROOT / "Mage.Tests" / "target" / "mage-tests.jar"))
 
 
 def build_krenko_command(args: argparse.Namespace) -> list[str]:
@@ -267,22 +260,21 @@ def build_krenko_command(args: argparse.Namespace) -> list[str]:
         "--output-dir", args.output_dir,
         "--version", str(args.version),
     ]
-    if KRENKO_JAR:
-        return [
-            "java",
-            "--enable-native-access=ALL-UNNAMED",
-            "-jar", KRENKO_JAR,
-        ] + exec_args
-    exec_args_str = " ".join(exec_args)
+    if getattr(args, "search_budget", None) is not None:
+        exec_args += ["--search-budget", str(args.search_budget)]
+    if getattr(args, "timeout_ms", None) is not None:
+        exec_args += ["--timeout-ms", str(args.timeout_ms)]
+    if getattr(args, "priors", None) is not None:
+        exec_args += ["--priors", str(args.priors).lower()]
+    if getattr(args, "noise", None) is not None:
+        exec_args += ["--noise", str(args.noise).lower()]
+    if getattr(args, "verbose", False):
+        exec_args += ["--verbose"]
     return [
-        "mvn",
-        "-pl",
-        "Mage.Tests",
-        "exec:java",
-        "-Dexec.classpathScope=test",
-        "-Dexec.mainClass=org.mage.test.AI.KrenkoMain",
-        f"-Dexec.args={exec_args_str}",
-    ]
+        "java",
+        "--enable-native-access=ALL-UNNAMED",
+        "-jar", KRENKO_JAR,
+    ] + exec_args
 
 
 def copy_new_files(new_files: list[Path], destination_root: Path, iteration: int) -> int:
@@ -440,6 +432,16 @@ def generate_data() -> None:
                              "KrenkoMain still reads host/port from its YAML config.")
     parser.add_argument("--server-threads", type=int, default=6,
                         help="Waitress thread count for the Python inference server.")
+    parser.add_argument("--search-budget", type=int, default=None,
+                        help="MCTS search budget (iterations per decision). Overrides config.")
+    parser.add_argument("--timeout-ms", type=int, default=None,
+                        help="MCTS timeout in milliseconds. Overrides config.")
+    parser.add_argument("--priors", default=None, action=argparse.BooleanOptionalAction,
+                        help="Enable/disable network policy priors. Overrides config.")
+    parser.add_argument("--noise", default=None, action=argparse.BooleanOptionalAction,
+                        help="Enable/disable Dirichlet noise. Overrides config.")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Log MCTS decision details (actions, visit counts, Q-values).")
     parser.add_argument("--python", default=sys.executable)
     args = parser.parse_args()
     _setup_logging()
@@ -512,6 +514,11 @@ def generate_data() -> None:
         threads=args.threads,
         output_dir=args.mage_output_dir,
         version=args.version,
+        search_budget=args.search_budget,
+        timeout_ms=args.timeout_ms,
+        priors=args.priors,
+        noise=args.noise,
+        verbose=args.verbose,
     )
 
     servers: list[subprocess.Popen] = []
@@ -542,13 +549,12 @@ def generate_data() -> None:
             args=(mage_iter_dir, existing, args.games, stop_event),
             daemon=True,
         )
-        with logging_redirect_tqdm():
-            watcher.start()
-            try:
-                run_command(build_krenko_command(krenko_args), cwd=MAGE_ROOT, env=os.environ.copy())
-            finally:
-                stop_event.set()
-                watcher.join(timeout=5)
+        watcher.start()
+        try:
+            run_command(build_krenko_command(krenko_args), cwd=MAGE_ROOT, env=os.environ.copy())
+        finally:
+            stop_event.set()
+            watcher.join(timeout=5)
 
         new_files = sorted(gather_hdf5_files(mage_iter_dir) - existing)
         if not new_files:

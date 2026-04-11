@@ -273,6 +273,7 @@ def build_krenko_command(args: argparse.Namespace) -> list[str]:
     return [
         "java",
         "--enable-native-access=ALL-UNNAMED",
+        "-Xmx15g",
         "-jar", KRENKO_JAR,
     ] + exec_args
 

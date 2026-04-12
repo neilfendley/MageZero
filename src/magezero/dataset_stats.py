@@ -8,13 +8,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import H5Indexed, collate_batch, create_redundancy_ignore_list
-from train import DECK_NAME, VER_NUMBER, GLOBAL_MAX,ActionType, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX
+from model import Net, load_model, GLOBAL_MAX, ACTIONS_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType
 
 
 
-SPLIT = "testing"          # "training" or "testing"
-OUT_DIR = "stats_out"       # where to save figures
-SHOW_PLOTS = True           # headless? set False
+SHOW_PLOTS = False          # headless? set False
 SAVE_PLOTS = True           # save PNGs to OUT_DIR
 TOP_K = 50                  # show first K bars for each head
 HIST_BINS = 21              # value histogram bins
@@ -25,9 +23,10 @@ if not SHOW_PLOTS:
     matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-DATA_DIR = f"data/{DECK_NAME}/ver{VER_NUMBER}/{SPLIT}"
-MODEL_DIR = f"models/{DECK_NAME}/ver{VER_NUMBER}"
-IGNORE_PATH = os.path.join(MODEL_DIR, "ignore.roar")
+DATA_DIR = None
+MODEL_DIR = None
+IGNORE_PATH = None
+OUT_DIR = None
 
 
 
@@ -224,7 +223,13 @@ def preview(ds: H5Indexed, n=PREVIEW_N, max_idx=96) -> str:
     return "\n".join(lines)
 
 
-def main():
+def main(deck, version, split):
+    global  DATA_DIR, MODEL_DIR, IGNORE_PATH, OUT_DIR
+    DATA_DIR = f"data/{deck}/ver{version}/{split}"
+    MODEL_DIR = f"models/{deck}/ver{version}"
+    IGNORE_PATH = os.path.join(MODEL_DIR, "ignore.roar")
+    OUT_DIR = f"models/{deck}/ver{version}"
+
     print(f"[load] {DATA_DIR}")
     ds = H5Indexed(DATA_DIR)
     print(f"[stats] samples={len(ds)}")
@@ -251,36 +256,36 @@ def main():
 
     # value histogram
     plot_value_hist(
-        sv["values"], HIST_BINS, f"Value labels ({DECK_NAME} v{VER_NUMBER} {SPLIT})",
-        os.path.join(OUT_DIR, f"value_hist_{DECK_NAME}_v{VER_NUMBER}_{SPLIT}.png") if SAVE_PLOTS else None
+        sv["values"], HIST_BINS, f"Value labels ({deck} v{version} {split})",
+        os.path.join(OUT_DIR, f"value_hist_{deck}_v{version}_{split}.png") if SAVE_PLOTS else None
     )
 
     # per-head avg policy bars
     plot_avg_bar(
         sv["avg_player_priority"], TOP_K, "Avg policy – Player PRIORITY",
-        os.path.join(OUT_DIR, f"avg_policy_pA_{DECK_NAME}_v{VER_NUMBER}_{SPLIT}.png") if SAVE_PLOTS else None
+        os.path.join(OUT_DIR, f"avg_policy_pA_{deck}_v{version}_{split}.png") if SAVE_PLOTS else None
     )
     plot_avg_bar(
         sv["avg_opponent_priority"], TOP_K, "Avg policy – Opponent PRIORITY",
-        os.path.join(OUT_DIR, f"avg_policy_pB_{DECK_NAME}_v{VER_NUMBER}_{SPLIT}.png") if SAVE_PLOTS else None
+        os.path.join(OUT_DIR, f"avg_policy_pB_{deck}_v{version}_{split}.png") if SAVE_PLOTS else None
     )
     plot_avg_bar(
         sv["avg_targets"], TOP_K, "Avg policy – CHOOSE_TARGET",
-        os.path.join(OUT_DIR, f"avg_policy_target_{DECK_NAME}_v{VER_NUMBER}_{SPLIT}.png") if SAVE_PLOTS else None
+        os.path.join(OUT_DIR, f"avg_policy_target_{deck}_v{version}_{split}.png") if SAVE_PLOTS else None
     )
     plot_avg_bar(
         sv["avg_binary"], TOP_K, "Avg policy – CHOOSE_USE",
-        os.path.join(OUT_DIR, f"avg_policy_binary_{DECK_NAME}_v{VER_NUMBER}_{SPLIT}.png") if SAVE_PLOTS else None
+        os.path.join(OUT_DIR, f"avg_policy_binary_{deck}_v{version}_{split}.png") if SAVE_PLOTS else None
     )
     """
     plot_idx_hist(
         sv["idxs"], "Idx occurrences",
-        os.path.join(OUT_DIR, f"idx_hist_{DECK_NAME}_v{VER_NUMBER}_{SPLIT}.png") if SAVE_PLOTS else None
+        os.path.join(OUT_DIR, f"idx_hist_{deck}_v{version}_{split}.png") if SAVE_PLOTS else None
     )
     """
     plot_idx_dist(
         sv["idxs"], "Idx distribution",
-        os.path.join(OUT_DIR, f"idx_dist_{DECK_NAME}_v{VER_NUMBER}_{SPLIT}.png") if SAVE_PLOTS else None
+        os.path.join(OUT_DIR, f"idx_dist_{deck}_v{version}_{split}.png") if SAVE_PLOTS else None
     )
 
 
@@ -289,4 +294,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--deck", required=True)
+    parser.add_argument("--version", type=int, required=True)
+    parser.add_argument("--split", default="testing")
+    args = parser.parse_args()
+    main(args.deck, args.version, args.split)

@@ -75,8 +75,20 @@ def load_model_weights(path_to_weights):
 
     ignore_path = Path(path_to_weights).parent / "ignore.roar"
     with open(ignore_path, "rb") as f:
-        ignore_bm = BitMap.deserialize(f.read())    
-    model.load_state_dict(ckpt["model_state_dict"])
+        ignore_bm = BitMap.deserialize(f.read())
+    sd = ckpt["model_state_dict"]
+
+    # Sparse-compressed checkpoints store only used rows; rebuild a dense embedding.
+    if "sparse_embedding" in ckpt:
+        sparse = ckpt["sparse_embedding"]
+        shape = tuple(sparse["shape"])
+        target_dtype = model.embedding_bag.weight.dtype
+        print(f"Reconstructing dense embedding {shape} from {sparse['indices'].numel()} sparse rows")
+        dense = torch.zeros(shape, dtype=target_dtype)
+        dense[sparse["indices"].long()] = sparse["values"].to(target_dtype)
+        sd["embedding_bag.weight"] = dense
+
+    model.load_state_dict(sd)
     model = model.to(DEVICE)
     return model, ignore_bm
 

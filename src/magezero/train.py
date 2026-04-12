@@ -49,6 +49,11 @@ HIDDEN_DIM = env_int("MAGEZERO_HIDDEN_DIM", 216)
 USE_MIXED_PRECISION = env_bool("MAGEZERO_MIXED_PRECISION", True)
 NUM_WORKERS = env_int("MAGEZERO_NUM_WORKERS", 0)
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# GradScaler / fp16 autocast are CUDA-only; force-disable on CPU.
+if DEVICE.type != "cuda":
+    USE_MIXED_PRECISION = False
+
 
 #TODO: wire into xmage data pipeline
 #for now just manually enter your matchup-specific action space sizes here for optimal normalization(XMage prints them at the start of each run)
@@ -211,7 +216,9 @@ def train():
         print("Loading existing ignore list from ignore.roar")
         with open(ignore_list_path, "rb") as f:
             loaded_bitmap = BitMap.deserialize(f.read())
-        ignore_list = list(loaded_bitmap)
+        # Use a set so the USE_PREVIOUS_MODEL path can call .intersection_update();
+        # downstream H5Indexed accepts set[int] anyway.
+        ignore_list = set(loaded_bitmap)
     else:
         print("Generating ignore list from dataset to use for model")
         ignore_list = create_redundancy_ignore_list(ds_raw, k=1)
@@ -229,8 +236,8 @@ def train():
     # actual_embeddings_needed = min(actual_max_idx, GLOBAL_MAX)
     # print(f"Dataset uses embeddings up to index {actual_max_idx - 1}. Allocating {actual_embeddings_needed} instead of {GLOBAL_MAX}.")
     
-    print(f"Loading Model")
-    model = Net(GLOBAL_MAX, ACTIONS_MAX).cuda()
+    print(f"Loading Model on {DEVICE}")
+    model = Net(GLOBAL_MAX, ACTIONS_MAX).to(DEVICE)
 
     # optional start point
     if USE_PREVIOUS_MODEL:
@@ -265,11 +272,12 @@ def train():
 
 
 
+    pin_memory = DEVICE.type == "cuda"
     dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, collate_fn=collate_batch,
-                    pin_memory=True, persistent_workers=False)
+                    pin_memory=pin_memory, persistent_workers=False)
 
     dl_test = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, collate_fn=collate_batch,
-                    pin_memory=True, persistent_workers=False)
+                    pin_memory=pin_memory, persistent_workers=False)
 
     test.SHOW_CONFUSION_MATRIX = False
     #optimizers
@@ -296,22 +304,20 @@ def train():
 
     #main training loop
     print(f"Beginning Training loop for {EPOCH_COUNT} epochs")
-    for epoch in range(1, EPOCH_COUNT+1):
+    for epoch in tqdm(range(1, EPOCH_COUNT+1), desc="epochs", unit="epoch", position=0):
         total_pA_loss, total_pB_loss, total_t_loss, total_b_loss, total_v_loss, total_l1_sparse_loss, total_l1_dense_loss = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         total_decision_examples, total_pA_examples, total_pB_examples, total_t_examples, total_b_examples = 0,0,0,0,0
         model.train()
 
-        for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in tqdm(dl):
-            # Move new input tensors to CUDA
-            batch_indices = batch_indices.cuda()
-            batch_offsets = batch_offsets.cuda()
-            batch_policy_labels = batch_policy_labels.cuda()
-            batch_value_labels = batch_value_labels.cuda()
-            is_players = is_players.cuda().squeeze(-1).to(torch.bool)
-            action_types = action_types.cuda().squeeze(-1).to(torch.long)
+        for batch_indices, batch_offsets, batch_policy_labels, batch_value_labels, is_players, action_types in tqdm(dl, desc=f"epoch {epoch}", leave=False, position=1):
+            batch_indices = batch_indices.to(DEVICE)
+            batch_offsets = batch_offsets.to(DEVICE)
+            batch_policy_labels = batch_policy_labels.to(DEVICE)
+            batch_value_labels = batch_value_labels.to(DEVICE)
+            is_players = is_players.to(DEVICE).squeeze(-1).to(torch.bool)
+            action_types = action_types.to(DEVICE).squeeze(-1).to(torch.long)
 
-            # Model call uses indices and offsets with mixed precision
-            with autocast(enabled=USE_MIXED_PRECISION, device_type="cuda"):
+            with autocast(enabled=USE_MIXED_PRECISION, device_type=DEVICE.type):
                 priority_logits, opponent_priority_logits, target_logits, binary_logits ,value_pred = model(batch_indices, batch_offsets)
 
 

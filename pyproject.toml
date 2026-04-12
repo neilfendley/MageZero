@@ -13,16 +13,28 @@ dependencies = [
     "scipy>=1.10",
     "waitress>=2.1",
     "tqdm>=4.67.3",
+    "pyyaml>=6.0",
 ]
 
 [build-system]
 requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
 [project.scripts]
-train = "magezero.train:train"
+train = "magezero.executor:train_cli"
+generate-data = "magezero.executor:generate_data"
 explore = "magezero.game_exploration:explore_game"
 stats = "magezero.dataset_stats:main"
+inspect-data = "magezero.inspect_data:main"
 server = "magezero.server:main"
 round = "magezero.executor:round_robin"
 onedeck = "magezero.executor:one_deck_per_model"

@@ -1,0 +1,24 @@
+# run.yml — defines a single deck training run
+
+deck: Standard-MonoB
+version: 1
+start_from_version: 1     # null = offline bootstrap, set to resume from checkpoint
+
+generations: 2
+games_per_gen: 100
+replay_buffer_gens: 10
+
+opponents:
+  - deck: Standard-MonoR
+    mode: minimax
+  - deck: Standard-MonoG
+    mode: minimax
+
+training:
+  analyze_dataset: true
+  generate_plots: true
+  eval_previous_model: true
+
+log_level: ACTIONS           # ALL | GAMEPLAY | ACTIONS | ERROR
+
+curriculum: configs/curriculum.yml

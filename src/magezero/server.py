@@ -1,6 +1,8 @@
 import os
 import threading
 import time
+import gc
+import subprocess
 from queue import Queue, Empty
 
 import torch
@@ -11,7 +13,7 @@ import msgpack
 import signal
 
 
-from .train import Net, GLOBAL_MAX, ACTIONS_MAX, VER_NUMBER, DECK_NAME, load_model
+from .train import Net, GLOBAL_MAX, ACTIONS_MAX, VER_NUMBER, DECK_NAME, load_model, EMBEDDING_DIM
 
 
 MODEL_DIR = f"models/{DECK_NAME}/ver{VER_NUMBER}"
@@ -42,6 +44,48 @@ req_counter = 0
 req_counter_lock = threading.Lock()
 
 
+def _current_rss_mb():
+    try:
+        rss_kb = subprocess.check_output(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            text=True,
+        ).strip()
+        return int(rss_kb) / 1024
+    except Exception:
+        return None
+
+
+def _log_memory(prefix):
+    rss_mb = _current_rss_mb()
+    if rss_mb is None:
+        print(prefix)
+    else:
+        print(f"{prefix} rss={rss_mb:.1f}MB")
+
+
+def _build_model_from_state_dict(state_dict):
+    emb_weight = state_dict["embedding_bag.weight"]
+    num_embeddings, embedding_dim = emb_weight.shape
+    policy_size_a = state_dict["player_priority_head.weight"].shape[0]
+
+    if embedding_dim != EMBEDDING_DIM:
+        raise ValueError(
+            f"Checkpoint embedding_dim={embedding_dim} does not match "
+            f"configured EMBEDDING_DIM={EMBEDDING_DIM}"
+        )
+
+    return Net(num_embeddings, policy_size_a).eval()
+
+
+def _release_model(model):
+    if model is None:
+        return
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def load_server_artifacts(path=MODEL):
 
     with open(IGNORE, "rb") as f:
@@ -58,33 +102,39 @@ def load_server_artifacts(path=MODEL):
 
 
 def reload_server_model():
-    global server_model, IGNORE_BM
-    print("Loading server artifacts...")
-    model, ignore_bm = load_server_artifacts()
-    print("Server model loaded.")
-
-    with model_lock:
-        server_model = model
-        IGNORE_BM = ignore_bm
+    load_server_weights(MODEL)
 
 def load_model_weights(path_to_weights):
     # path_to_weights = Path(path_to_weights)
     print("Loading server artifacts...")
     ckpt = load_model(path_to_weights, device='cpu')
-    model = Net(GLOBAL_MAX, ACTIONS_MAX).eval()
+    state_dict = ckpt["model_state_dict"]
+    model = _build_model_from_state_dict(state_dict)
 
     ignore_path = Path(path_to_weights).parent / "ignore.roar"
     with open(ignore_path, "rb") as f:
         ignore_bm = BitMap.deserialize(f.read())    
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(state_dict)
+    del state_dict
+    del ckpt
+    gc.collect()
     model = model.to(DEVICE)
+    _log_memory("[LOAD] model ready")
     return model, ignore_bm
 
 def load_server_weights(path_to_weights):
     global server_model, IGNORE_BM
+    old_model = None
+    old_ignore = None
     with model_lock:
-        del server_model
-        del IGNORE_BM
+        old_model = server_model
+        old_ignore = IGNORE_BM
+        server_model = None
+        IGNORE_BM = BitMap()
+    _release_model(old_model)
+    del old_ignore
+    gc.collect()
+    _log_memory("[LOAD] previous model released")
     model, bm = load_model_weights(path_to_weights)
     with model_lock:
         server_model = model
@@ -185,6 +235,12 @@ def worker_loop():
 
         # Single forward pass
         with model_lock:
+            if server_model is None:
+                for p in batch:
+                    p.out = {"error": "model not loaded"}
+                    p.t_done = time.perf_counter()
+                    p.evt.set()
+                continue
             with torch.no_grad():
                 pA, pB, tgt, bin2, val = server_model(idx, off)
 

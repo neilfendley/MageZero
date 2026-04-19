@@ -48,7 +48,7 @@ SRC = "src/magezero"
 PYTHON = sys.executable
 EPOCHS_BOOTSTRAP = 50
 EPOCHS_ONLINE = 10
-
+MAGE_DIR = "/home/raven/Fendley/MagicAI/mage"
 
 # ─── deck-level state (session counter) ──────────────────────
 
@@ -162,7 +162,7 @@ def latest_version(deck: str) -> Optional[int]:
 
 
 def has_checkpoint(deck: str, version: int) -> bool:
-    return (Path("models") / deck / f"ver{version}" / "model.pt.gz").exists()
+    return (Path("models") / deck / f"ver{version}" / "model.pt").exists()
 
 
 def copy_starting_checkpoint(run: RunConfig) -> None:
@@ -176,20 +176,19 @@ def copy_starting_checkpoint(run: RunConfig) -> None:
     dst.mkdir(parents=True, exist_ok=True)
     for name in ("model.pt.gz", "ignore.roar"):
         f = src / name
-        if f.exists():
+        if f.exists() and not f.exists():
             shutil.copy(f, dst / name)
 
 
 # ─── data file path helpers ──────────────────────────────────
-
 def primary_file(deck: str, version: int, sid: int, opponent: str) -> Path:
-    name = f"session{sid}_{deck}_vs_{opponent}.hdf5"
-    return Path("data") / deck / f"ver{version}" / "testing" / name
+    name = f"session{sid}_{deck}_vs_{opponent}.a.hdf5"
+    return Path("data") / deck / f"ver{version}" / "training" / name
 
 
 def opponent_file(opp: str, opp_ver: int, sid: int, primary: str) -> Path:
-    name = f"session{sid}_{opp}_vs_{primary}.hdf5"
-    return Path("data") / opp / f"ver{opp_ver}" / "archive" / name
+    name = f"session{sid}_{opp}_vs_{primary}.b.hdf5"
+    return Path("data") / opp / f"ver{opp_ver}" / "training" / name
 
 
 def parse_session_id(filename: str) -> Optional[int]:
@@ -203,12 +202,12 @@ def parse_session_id(filename: str) -> Optional[int]:
 # ─── game.yml mutation ───────────────────────────────────────
 
 def build_game_yml(base_path: str, settings: GenSettings, run: RunConfig,
-                   opp: Opponent, primary_out: Path, opponent_out: Path,
+                   player_deck: Opponent, opp: Opponent, primary_out: Path, opponent_out: Path,
                    primary_offline: bool, opp_offline: bool) -> str:
     with open(base_path) as f:
         cfg = yaml.safe_load(f)
 
-    decks_dir = Path("xmage/decks").resolve()
+    decks_dir = Path(f"{MAGE_DIR}/decks").resolve()
 
     pa = cfg["player_a"]
     pa["deckPath"] = str(decks_dir / f"{run.deck}.dck")
@@ -250,8 +249,8 @@ def start_server(deck: str, version: int, port: int, run_dir: Path) -> subproces
     proc = subprocess.Popen(
         [PYTHON, f"{SRC}/server.py",
          "--deck", deck, "--version", str(version), "--port", str(port)],
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
+        # stdout=log_file,
+        # stderr=subprocess.STDOUT,
     )
     proc._mz_log_file = log_file
 
@@ -283,14 +282,36 @@ def stop_server(proc: subprocess.Popen) -> None:
 
 def launch_jvm(game_yml_path: str) -> None:
     print(f"[jvm] launching with {game_yml_path}")
-    subprocess.run(
-        ["cmd", "/c", "xmage\\mz-xmage.bat", str(Path(game_yml_path).resolve())],
-        check=True,
-    )
+    import platform
+
+    current_os = platform.system()
+
+    if current_os == "Windows":
+        print("Running on Windows")
+        shell = True
+    elif current_os == "Darwin":
+        print("Running on macOS")
+        shell = False
+    else:
+        shell = False
+    cmd = [
+        "mvn",
+        "-pl",
+        "Mage.MageZero",
+        "exec:java",
+        "-Dexec.mainClass=org.mage.magezero.MageZeroMain",
+        "-Dexec.args=" + str(Path(game_yml_path).resolve()),
+    ]
+    cwd = MAGE_DIR
+    subprocess.run(cmd, cwd=cwd, check=True, shell=shell)
+    # subprocess.run(
+    #     # ["cmd", "/c", "xmage\\mz-xmage.bat", str(Path(game_yml_path).resolve())],
+    #     check=True,
+    # )
 
 
 def run_train(deck: str, version: int, epochs: int, use_checkpoint: bool,
-              run_dir: Path, gen: int) -> None:
+              run_dir: Path) -> None:
     cmd = [PYTHON, f"{SRC}/train.py",
            "--deck", deck, "--version", str(version),
            "--epochs", str(epochs)]
@@ -298,18 +319,18 @@ def run_train(deck: str, version: int, epochs: int, use_checkpoint: bool,
         cmd.append("--checkpoint")
     log_path = run_dir / "train.log"
     with open(log_path, "a") as f:
-        f.write(f"\n=== GEN {gen} TRAIN {datetime.now().isoformat()} ===\n")
+        f.write(f"\n=== GEN {version} TRAIN {datetime.now().isoformat()} ===\n")
         f.flush()
-        subprocess.run(cmd, check=True, stdout=f, stderr=subprocess.STDOUT)
+        subprocess.run(cmd, check=True, stderr=subprocess.STDOUT)
 
 
-def run_test(deck: str, version: int, run_dir: Path, gen: int) -> None:
+def run_test(deck: str, version: int, run_dir: Path, gen: int, training=True) -> None:
     log_path = run_dir / "test.log"
     with open(log_path, "a") as f:
         f.write(f"\n=== GEN {gen} TEST {datetime.now().isoformat()} ===\n")
         f.flush()
         subprocess.run(
-            [PYTHON, f"{SRC}/test.py", "--deck", deck, "--version", str(version)],
+            [PYTHON, f"{SRC}/test.py", "--deck", deck, "--version", str(version), "--train-set" if training else None],
             check=True, stdout=f, stderr=subprocess.STDOUT,
         )
 
@@ -415,7 +436,6 @@ def run_pipeline(run: RunConfig, curriculum: CurriculumConfig,
                 opp_ver = 1
             opp_offline = (opp.mode == "mcts") and not has_checkpoint(opp.deck, opp_ver)
             primary_offline = bootstrap
-
             primary_sid = next_session_id(run.deck)
             opponent_sid = next_session_id(opp.deck)
             primary_path = primary_file(run.deck, run.version, primary_sid, opp.deck)

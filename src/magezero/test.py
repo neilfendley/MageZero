@@ -4,8 +4,8 @@ from pyroaring import BitMap
 from torch import nn  # optim is not strictly needed for testing if not optimizing
 from torch.utils.data import DataLoader
 
-from dataset import H5Indexed, collate_batch, filter_opponent_states
-from model import Net, load_model, GLOBAL_MAX, ACTIONS_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
+from magezero.dataset import H5Indexed, collate_batch, filter_opponent_states
+from magezero.model import Net, load_model, GLOBAL_MAX, ACTIONS_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
 
 SHOW_CONFUSION_MATRIX = True
 
@@ -182,6 +182,7 @@ if __name__ == "__main__":
     parser.add_argument("--deck", required=True)
     parser.add_argument("--version", type=int, required=True)
     parser.add_argument("--opponent-head", action="store_true")
+    parser.add_argument("--train-set", action="store_true", help="Use training set instead of test set for validation (for debugging)")
     args = parser.parse_args()
 
     ignore_path = f"models/{args.deck}/ver{args.version}/ignore.roar"
@@ -189,7 +190,12 @@ if __name__ == "__main__":
         ignore = BitMap.deserialize(f.read())
     print(f"ignore list size: {len(ignore)}")
 
-    ds = H5Indexed(f"data/{args.deck}/ver{args.version}/testing", set(ignore))
+    if args.train_set:
+        set_name = "training"
+    else:
+        set_name = "test"
+    ## NMF TODO: THIS SHOULD BE A PARAM?
+    ds = H5Indexed(f"data/{args.deck}/ver{args.version}/{set_name}", set(ignore))
     if not args.opponent_head:
         ds = filter_opponent_states(ds, TARGETS_MAX)
 

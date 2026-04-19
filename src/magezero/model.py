@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 import math
-import gzip
+import mgzip
 from enum import Enum
 
 """
@@ -51,8 +51,8 @@ class Net(nn.Module):
         super().__init__()
 
 
-        embedding_dim = 512  # Output of EmbeddingBag
-        hidden_dim_mlp = 256  # Output of the main MLP block
+        embedding_dim = 432  # Output of EmbeddingBag
+        hidden_dim_mlp = 216  # Output of the main MLP block
         self.embedding_bag = nn.EmbeddingBag(
             num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
@@ -104,9 +104,9 @@ class Net(nn.Module):
 
 def load_model(path):
     if path.endswith('.gz'):
-        with gzip.open(path, 'rb') as f:
+        with mgzip.open(path, 'rb', thread=8) as f:
             return torch.load(f)
-    return torch.load(path)
+    return torch.load(path, map_location='cpu')
 
 def normalize_policy_labels(raw: torch.Tensor) -> torch.Tensor:
     total = raw.sum(dim=1, keepdim=True).clamp(min=1e-8)

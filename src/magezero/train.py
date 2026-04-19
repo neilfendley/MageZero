@@ -5,13 +5,14 @@ import torch.nn.functional as F
 from torch import nn, optim
 from torch.utils.data import DataLoader
 import os
-import gzip
+import mgzip
 import shutil
 
-import test
-from model import Net, load_model, GLOBAL_MAX, ACTIONS_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
-from dataset import H5Indexed, collate_batch,  create_redundancy_ignore_list, filter_opponent_states
+from magezero import test
+from magezero.model import Net, load_model, GLOBAL_MAX, ACTIONS_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
+from magezero.dataset import H5Indexed, collate_batch,  create_redundancy_ignore_list, filter_opponent_states
 from pyroaring import BitMap
+from tqdm import tqdm
 
 #add training data under: data/{deck name}/ver{your version num}/training/{your data}.hdf5
 
@@ -28,7 +29,7 @@ def train(
     os.makedirs(f"models/{deck}/ver{version}", exist_ok=True)
     ds_raw = H5Indexed(f"data/{deck}/ver{version}/training")
 
-
+    
     #ignore handling
     print("Generating ignore list from dataset to use for model")
     ignore_list = create_redundancy_ignore_list(ds_raw)
@@ -102,7 +103,9 @@ def train(
     kld = nn.KLDivLoss(reduction='batchmean')
 
     #main training loop
-    for epoch in range(1, epochs+1):
+    pbar = tqdm(range(1, epochs+1))
+    print("Starting Training loop for deck:", deck)
+    for epoch in pbar:
         total_pA_loss, total_pB_loss, total_t_loss, total_b_loss, total_v_loss, total_l1_sparse_loss, total_l1_dense_loss = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         total_decision_examples, total_pA_examples, total_pB_examples, total_t_examples, total_b_examples = 0,0,0,0,0
         model.train()
@@ -200,17 +203,20 @@ def train(
         avg_v_loss = total_v_loss / len(dl)
         avg_l1_dense_loss = total_l1_dense_loss / len(dl)
         avg_l1_sparse_loss = total_l1_sparse_loss / len(dl)
-        print(f"Epoch {epoch}  priority_A_loss={avg_pA_loss:.3f}  priority_B_loss={avg_pB_loss:.3f} choose_target_loss={avg_t_loss:.3f} choose_use_loss={avg_b_loss:.3f} value_loss={avg_v_loss:.3f} "
-              f"l1_dense={avg_l1_dense_loss} l1_sparse={avg_l1_sparse_loss} decision_states={total_decision_examples}")
+        pbar.set_description(f"priority_A_loss={avg_pA_loss:.3f}  priority_B_loss={avg_pB_loss:.3f} choose_target_loss={avg_t_loss:.3f} choose_use_loss={avg_b_loss:.3f} value_loss={avg_v_loss:.3f} "
+                             + f"l1_dense={avg_l1_dense_loss:.3f} l1_sparse={avg_l1_sparse_loss:.3f} decision_states={total_decision_examples}")
+        # print(f"Epoch {epoch}  priority_A_loss={avg_pA_loss:.3f}  priority_B_loss={avg_pB_loss:.3f} choose_target_loss={avg_t_loss:.3f} choose_use_loss={avg_b_loss:.3f} value_loss={avg_v_loss:.3f} "
+        #       f"l1_dense={avg_l1_dense_loss} l1_sparse={avg_l1_sparse_loss} decision_states={total_decision_examples}")
         #run current model on testing set (if there is one)
         if len(test_ds)>0:
             test.validate(model, dl_test)
         #TODO: make validation based checkpoint schedule
         if epoch == epochs:
-            checkpoint_save_path = f"models/{deck}/ver{version}/model.pt.gz"
-            temp_path = checkpoint_save_path.replace('.gz', '.tmp')
+            checkpoint_save_path = f"models/{deck}/ver{version}/model.pt"
+            # temp_path = checkpoint_save_path.replace('.gz', '.tmp')
 
-            # Save uncompressed
+            # Save uncompressed'
+            print('Saving model checkpoint...')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -218,14 +224,25 @@ def train(
                 'optimizer_dense_state_dict': opt_dense.state_dict(),
                 'avg_p_loss': avg_pA_loss,
                 'avg_v_loss': avg_v_loss,
-            }, temp_path)
-
+            }, checkpoint_save_path)
+            
             # Stream-compress in chunks (constant memory)
-            with open(temp_path, 'rb') as f_in:
-                with gzip.open(checkpoint_save_path, 'wb', compresslevel=1) as f_out:
-                    shutil.copyfileobj(f_in, f_out, length=16 * 1024 * 1024)  # 16MB chunks
+            # with open(temp_path, 'rb') as f_in:
+            #     with mgzip.open(checkpoint_save_path, 'wb', compresslevel=1, threads=8) as f_out:
+            #         shutil.copyfileobj(f_in, f_out, length=16 * 1024 * 1024)  # 16MB chunks
 
-            os.remove(temp_path)
+            # os.remove(temp_path)
+
+def run_train():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--deck", required=True)
+    parser.add_argument("--version", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--checkpoint", action="store_true")
+    args = parser.parse_args()
+    train(args.deck, args.version, args.epochs, args.checkpoint)
+
 
 if __name__ == "__main__":
     import argparse

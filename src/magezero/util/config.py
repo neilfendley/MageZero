@@ -40,6 +40,17 @@ class RunConfig:
     log_level: str
     curriculum_path: str
 
+@dataclass
+class RunRoundConfig:
+    deck_pool: list[Opponent]
+    version: int
+    start_from_version: Optional[int]
+    generations: int
+    games_per_gen: int
+    replay_buffer_gens: int
+    training: TrainingFlags
+    log_level: str
+    curriculum_path: str
 
 @dataclass
 class Priors:
@@ -115,6 +126,38 @@ def load_run(path: str = "configs/run.yml") -> RunConfig:
         curriculum_path=raw.get("curriculum", "configs/curriculum.yml"),
     )
 
+def load_round_run(path: str = "configs/run.yml") -> RunRoundConfig:
+    raw = _load_yaml(path)
+    mode = raw.get("mode", "minimax")
+    version = raw.get("version", 1)
+    deck_pool = []
+    if mode not in VALID_MODES:
+        raise ValueError(f"Invalid opponent mode '{mode}', must be one of {VALID_MODES}")
+        
+    for o in raw.get("deck_pool", []):
+        deck_pool.append(Opponent(
+            deck=o,
+            mode=mode,
+            version=version,
+        ))
+
+    log_level = raw.get("log_level", "ACTIONS")
+    if log_level not in VALID_LOG_LEVELS:
+        raise ValueError(f"Invalid log_level '{log_level}', must be one of {VALID_LOG_LEVELS}")
+
+    training_raw = raw.get("training", {})
+
+    return RunRoundConfig(
+        deck_pool=deck_pool,
+        version=raw.get("version", 1),
+        start_from_version=raw.get("start_from_version"),
+        generations=raw["generations"],
+        games_per_gen=raw["games_per_gen"],
+        replay_buffer_gens=raw.get("replay_buffer_gens", 3),
+        training=TrainingFlags(**training_raw),
+        log_level=log_level,
+        curriculum_path=raw.get("curriculum", "configs/curriculum.yml"),
+    )
 
 def load_curriculum(path: str = "configs/curriculum.yml") -> CurriculumConfig:
     raw = _load_yaml(path)

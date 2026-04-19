@@ -15,8 +15,8 @@ import sys
 import zipfile
 from pathlib import Path
 
-from magezero.util.config import load_all
-from magezero import runner
+from magezero.util.config import load_all, load_round_run, load_curriculum
+from magezero import runner, round_runner
 
 
 # ─── train ───────────────────────────────────────────────────
@@ -25,7 +25,11 @@ def cmd_train(args: argparse.Namespace) -> None:
     run_cfg, cur_cfg = load_all(args.run)
     runner.run_pipeline(run_cfg, cur_cfg, base_game_yml=args.game)
 
-
+# ─── round ───────────────────────────────────────────────────
+def cmd_round(args: argparse.Namespace) -> None:
+    run_cfg = load_round_run(args.run)
+    cur_cfg = load_curriculum(run_cfg.curriculum_path)
+    round_runner.round_pipeline(run_cfg, cur_cfg, base_game_yml=args.game)
 # ─── batch ───────────────────────────────────────────────────
 
 def cmd_batch(args: argparse.Namespace) -> None:
@@ -109,6 +113,11 @@ def main() -> None:
     p_train.add_argument("--run", default="configs/run.yml")
     p_train.add_argument("--game", default="configs/game.yml")
     p_train.set_defaults(func=cmd_train)
+
+    p_round = sub.add_parser("round", help="full curriculum pipeline")
+    p_round.add_argument("--run", default="configs/run.yml")
+    p_round.add_argument("--game", default="configs/game.yml")
+    p_round.set_defaults(func=cmd_round)
 
     p_batch = sub.add_parser("batch", help="single JVM launch")
     p_batch.add_argument("--config", default="configs/game.yml")

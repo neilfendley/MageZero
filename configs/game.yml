@@ -22,7 +22,7 @@ player_a:
     selection_temperature: 2
 
   mcts:
-    search_budget: 1000
+    search_budget: 500
     timeout_ms: 4000
     td_discount: 0.85
     offline_mode: false
@@ -52,7 +52,7 @@ player_b:
     selection_temperature: 2
 
   mcts:
-    search_budget: 1000
+    search_budget: 500
     timeout_ms: 4000
     td_discount: 0.85
     offline_mode: false
@@ -66,7 +66,7 @@ player_b:
 
 training:
   games: 200
-  threads: 4
+  threads: 16
   max_turns: 50
 
 server:

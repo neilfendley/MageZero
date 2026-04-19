@@ -5,7 +5,7 @@ from torch import nn  # optim is not strictly needed for testing if not optimizi
 from torch.utils.data import DataLoader
 
 from magezero.dataset import H5Indexed, collate_batch, filter_opponent_states
-import magezero.train as train
+from magezero.model import Net, load_model, GLOBAL_MAX, ACTIONS_MAX, PRIORITY_A_MAX, PRIORITY_B_MAX, TARGETS_MAX, BINARY_MAX, ActionType, lambda_pA, lambda_pB, lambda_t, lambda_b, normalize_policy_labels
 
 SHOW_CONFUSION_MATRIX = True
 
@@ -33,14 +33,15 @@ def print_matrix(matrix):
             print(row_str)
     else:
         # Print header for predicted actions
-        header = "True |" + "".join([f"{j: >4}" for j in range(matrix_size)])
+        indices = [i for i in range(matrix_size) if matrix[i].sum() > 0]
+        header = "True |" + "".join([f"{j: >4}" for j in indices])
         print(header)
         print("-" * len(header))
 
         # Print each row for true actions
-        for r in range(matrix_size):
+        for r in indices:
             row_str = f"{r: >4} |"
-            row_str += "".join([f"{matrix[r, c].item(): >4}" for c in range(matrix_size)])
+            row_str += "".join([f"{matrix[r, c].item(): >4}" for c in indices])
             print(row_str)
 
     print("-" * 60)
@@ -55,10 +56,10 @@ def validate(model, dl):
     # Metrics accumulators
     total_decision_examples = 0
     total_combined_loss, total_pA_loss, total_pB_loss, total_t_loss, total_b_loss, total_v_loss = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0  # Initialize as floats
-    pA_matrix = torch.zeros(train.PRIORITY_A_MAX, train.PRIORITY_A_MAX, dtype=torch.long)
-    pB_matrix = torch.zeros(train.PRIORITY_B_MAX, train.PRIORITY_B_MAX, dtype=torch.long)
-    t_matrix = torch.zeros(train.TARGETS_MAX, train.TARGETS_MAX, dtype=torch.long)
-    b_matrix = torch.zeros(train.BINARY_MAX, train.BINARY_MAX, dtype=torch.long)
+    pA_matrix = torch.zeros(PRIORITY_A_MAX, PRIORITY_A_MAX, dtype=torch.long)
+    pB_matrix = torch.zeros(PRIORITY_B_MAX, PRIORITY_B_MAX, dtype=torch.long)
+    t_matrix = torch.zeros(TARGETS_MAX, TARGETS_MAX, dtype=torch.long)
+    b_matrix = torch.zeros(BINARY_MAX, BINARY_MAX, dtype=torch.long)
     #model = train.Net(train.GLOBAL_MAX, train.ACTIONS_MAX).cuda()
     model.eval()
     with torch.no_grad():
@@ -76,20 +77,20 @@ def validate(model, dl):
                                                                                                         batch_offsets)
 
             nonzero = (batch_policy_labels > 0).sum(dim=1)  # [B]
-            decision_mask = nonzero > 1  # [B] states where more than one action is available
-            priority_mask = (action_types == train.ActionType.PRIORITY.value) & is_players & decision_mask
-            opponent_priority_mask = (action_types == train.ActionType.PRIORITY.value) & (~is_players) & decision_mask
-            target_mask = (action_types == train.ActionType.CHOOSE_TARGET.value) & decision_mask
-            binary_mask = (action_types == train.ActionType.CHOOSE_USE.value) & decision_mask
+            decision_mask = nonzero > 0  # [B] states where more than one action is available
+            priority_mask = (action_types == ActionType.PRIORITY.value) & is_players & decision_mask
+            opponent_priority_mask = (action_types == ActionType.PRIORITY.value) & (~is_players) & decision_mask
+            target_mask = (action_types == ActionType.CHOOSE_TARGET.value) & decision_mask
+            binary_mask = (action_types == ActionType.CHOOSE_USE.value) & decision_mask
 
 
             total_decision_examples += decision_mask.sum().item()
 
             # priority A
             if priority_mask.any():
-                log_probs_d = F.log_softmax(priority_logits[priority_mask][:, :train.PRIORITY_A_MAX], dim=1)
-                tgt = train.normalize_policy_labels(batch_policy_labels[priority_mask][:, :train.PRIORITY_A_MAX])
-                lpA = kld(log_probs_d, tgt)*train.lambda_pA
+                log_probs_d = F.log_softmax(priority_logits[priority_mask][:, :PRIORITY_A_MAX], dim=1)
+                tgt = normalize_policy_labels(batch_policy_labels[priority_mask][:, :PRIORITY_A_MAX])
+                lpA = kld(log_probs_d, tgt)*lambda_pA
                 s = log_probs_d.size(0)
                 total_pA_loss += lpA.item() * s
                 populate_matrix(pA_matrix, torch.argmax(tgt, dim=1), torch.argmax(log_probs_d, dim=1))
@@ -98,9 +99,9 @@ def validate(model, dl):
 
             # priority B (this uses virtual visits)
             if opponent_priority_mask.any():
-                log_probs_d = F.log_softmax(opponent_priority_logits[opponent_priority_mask][:, :train.PRIORITY_B_MAX], dim=1)
-                tgt = train.normalize_policy_labels(batch_policy_labels[opponent_priority_mask][:, :train.PRIORITY_B_MAX])
-                lpB = kld(log_probs_d, tgt)*train.lambda_pB
+                log_probs_d = F.log_softmax(opponent_priority_logits[opponent_priority_mask][:, :PRIORITY_B_MAX], dim=1)
+                tgt = normalize_policy_labels(batch_policy_labels[opponent_priority_mask][:, :PRIORITY_B_MAX])
+                lpB = kld(log_probs_d, tgt)*lambda_pB
                 s = log_probs_d.size(0)
                 total_pB_loss += lpB.item() * s
                 populate_matrix(pB_matrix, torch.argmax(tgt, dim=1), torch.argmax(log_probs_d, dim=1))
@@ -109,9 +110,9 @@ def validate(model, dl):
 
             # targets (shared between both players)
             if target_mask.any():
-                log_probs_d = F.log_softmax(target_logits[target_mask][:, :train.TARGETS_MAX], dim=1)
-                tgt = train.normalize_policy_labels(batch_policy_labels[target_mask][:, :train.TARGETS_MAX])
-                lt = kld(log_probs_d, tgt)*train.lambda_t
+                log_probs_d = F.log_softmax(target_logits[target_mask][:, :TARGETS_MAX], dim=1)
+                tgt = normalize_policy_labels(batch_policy_labels[target_mask][:, :TARGETS_MAX])
+                lt = kld(log_probs_d, tgt)*lambda_t
                 s = log_probs_d.size(0)
                 total_t_loss += lt.item() * s
                 populate_matrix(t_matrix, torch.argmax(tgt, dim=1), torch.argmax(log_probs_d, dim=1))
@@ -120,9 +121,9 @@ def validate(model, dl):
 
             # binary (choose to use) decisions
             if binary_mask.any():
-                log_probs_d = F.log_softmax(binary_logits[binary_mask][:, :train.BINARY_MAX], dim=1)
-                tgt = train.normalize_policy_labels(batch_policy_labels[binary_mask][:, :train.BINARY_MAX])
-                lb = kld(log_probs_d, tgt)*train.lambda_b
+                log_probs_d = F.log_softmax(binary_logits[binary_mask][:, :BINARY_MAX], dim=1)
+                tgt = normalize_policy_labels(batch_policy_labels[binary_mask][:, :BINARY_MAX])
+                lb = kld(log_probs_d, tgt)*lambda_b
                 s = log_probs_d.size(0)
                 total_b_loss += lb.item() * s
                 populate_matrix(b_matrix, torch.argmax(tgt, dim=1), torch.argmax(log_probs_d, dim=1))
@@ -176,29 +177,42 @@ def validate(model, dl):
             print("No choose_use samples in test set to calculate accuracy.")
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--deck", required=True)
+    parser.add_argument("--version", type=int, required=True)
+    parser.add_argument("--opponent-head", action="store_true")
+    parser.add_argument("--train-set", action="store_true", help="Use training set instead of test set for validation (for debugging)")
+    args = parser.parse_args()
 
-
-    with open(f"models/{train.DECK_NAME}/ver{train.VER_NUMBER}/ignore.roar", "rb") as f:
+    ignore_path = f"models/{args.deck}/ver{args.version}/ignore.roar"
+    with open(ignore_path, "rb") as f:
         ignore = BitMap.deserialize(f.read())
     print(f"ignore list size: {len(ignore)}")
 
-    ds = H5Indexed(f"data/{train.DECK_NAME}/ver{train.VER_NUMBER}/testing", set(ignore))
+    if args.train_set:
+        set_name = "training"
+    else:
+        set_name = "test"
+    ## NMF TODO: THIS SHOULD BE A PARAM?
+    ds = H5Indexed(f"data/{args.deck}/ver{args.version}/{set_name}", set(ignore))
+    if not args.opponent_head:
+        ds = filter_opponent_states(ds, TARGETS_MAX)
 
-    if not train.TRAIN_OPPONENT_HEAD:
-        ds = filter_opponent_states(ds,train.TARGETS_MAX)
+    dl = DataLoader(ds, batch_size=128, shuffle=False, num_workers=0,
+                    collate_fn=collate_batch, pin_memory=True, persistent_workers=False)
 
-    dl = DataLoader(ds, batch_size=128, shuffle=False, num_workers=0, collate_fn=collate_batch, pin_memory=True, persistent_workers=False)
-    model = train.Net(train.GLOBAL_MAX, train.ACTIONS_MAX).cuda()
+    model = Net(GLOBAL_MAX, ACTIONS_MAX).cuda()
     model.eval()
 
-    checkpoint_path = f"models/{train.DECK_NAME}/ver{train.VER_NUMBER}/model.pt.gz"  # Make sure this is the correct checkpoint
+    checkpoint_path = f"models/{args.deck}/ver{args.version}/model.pt.gz"
     try:
-        checkpoint = train.load_model(checkpoint_path)
-        #checkpoint = torch.load(checkpoint_path, map_location="cuda")
+        checkpoint = load_model(checkpoint_path)
         model.load_state_dict(checkpoint['model_state_dict'])
         print(f"Loaded checkpoint from {checkpoint_path}")
     except FileNotFoundError:
-        print(f"ERROR: Checkpoint file not found at {checkpoint_path}. Testing with an uninitialized model.")
+        print(f"ERROR: Checkpoint not found at {checkpoint_path}. Testing with uninitialized model.")
     except Exception as e:
-        print(f"ERROR: Could not load checkpoint. {e}. Testing with an uninitialized model.")
+        print(f"ERROR: Could not load checkpoint: {e}. Testing with uninitialized model.")
+
     validate(model, dl)

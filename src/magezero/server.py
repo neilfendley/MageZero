@@ -4,95 +4,56 @@ import time
 from queue import Queue, Empty
 
 import torch
+import waitress
 from pyroaring import BitMap
 from flask import Flask, request, Response
-from pathlib import Path
 import msgpack
-import signal
+from magezero.model import Net, load_model, GLOBAL_MAX, ACTIONS_MAX
 
-
-from .train import Net, GLOBAL_MAX, ACTIONS_MAX, VER_NUMBER, DECK_NAME, load_model
-
-
-MODEL_DIR = f"models/{DECK_NAME}/ver{VER_NUMBER}"
-IGNORE = MODEL_DIR + "/ignore.roar"
-MODEL = MODEL_DIR + "/model.pt"
 
 # Device setup
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Valid range bitmap for bounds checking (roaring compresses this to ~bytes)
-VALID_RANGE = BitMap(range(GLOBAL_MAX))
-
-model_lock = threading.RLock()
-IGNORE_BM = BitMap()
-server_model = None
-
 # Threading config
-TORCH_THREADS = os.environ.get("MAGEZERO_SERVER_THREADS", os.cpu_count() // 2)
-torch.set_num_threads(int(TORCH_THREADS))
+TORCH_THREADS = 1 # max(1, os.cpu_count() // 2)
+torch.set_num_threads(TORCH_THREADS)
 
 # Batching config
-MAX_BATCH = 24
+MAX_BATCH = 64
 MAX_WAIT_MS = 0
+
+#module state
+server_model = None
+IGNORE_BM = None
+VALID_RANGE = None
 
 app = Flask(__name__)
 
 req_counter = 0
 req_counter_lock = threading.Lock()
 
+def init(deck: str, version: int, port: int):
+    import logging
+    logging.getLogger("waitress").setLevel(logging.ERROR)
+    global server_model, IGNORE_BM, VALID_RANGE
 
-def load_server_artifacts(path=MODEL):
-
-    with open(IGNORE, "rb") as f:
-        ignore_bm = BitMap.deserialize(f.read())
-
-    model = Net(GLOBAL_MAX, ACTIONS_MAX).eval()
-    print(f'Model loaded, Must load weights to use model"')
-    # ckpt = load_model(path, device='cpu')
-    # model.load_state_dict(ckpt["model_state_dict"])
-    # model = model.to(DEVICE)
-    # print("Model weights loaded.")
-    # print("Model artifacts loaded. )
-    return model, ignore_bm
-
-
-def reload_server_model():
-    global server_model, IGNORE_BM
-    print("Loading server artifacts...")
-    model, ignore_bm = load_server_artifacts()
-    print("Server model loaded.")
-
-    with model_lock:
-        server_model = model
-        IGNORE_BM = ignore_bm
-
-def load_model_weights(path_to_weights):
-    # path_to_weights = Path(path_to_weights)
-    print("Loading server artifacts...")
-    ckpt = load_model(path_to_weights, device='cpu')
-    model = Net(GLOBAL_MAX, ACTIONS_MAX).eval()
-
-    ignore_path = Path(path_to_weights).parent / "ignore.roar"
+    model_dir = f"models/{deck}/ver{version}"
+    ignore_path = f"{model_dir}/ignore.roar"
+    model_path = f"{model_dir}/model.pt"
     with open(ignore_path, "rb") as f:
-        ignore_bm = BitMap.deserialize(f.read())    
-    model.load_state_dict(ckpt["model_state_dict"])
-    model = model.to(DEVICE)
-    return model, ignore_bm
+        IGNORE_BM = BitMap.deserialize(f.read())
+    VALID_RANGE = BitMap()
+    VALID_RANGE.add_range(0, GLOBAL_MAX)
 
-def load_server_weights(path_to_weights):
-    global server_model, IGNORE_BM
-    with model_lock:
-        del server_model
-        del IGNORE_BM
-    model, bm = load_model_weights(path_to_weights)
-    with model_lock:
-        server_model = model
-        IGNORE_BM = bm
-    print("Server model weights reloaded.")
+    server_model = Net(GLOBAL_MAX, ACTIONS_MAX)
+    ckpt = load_model(model_path)
+    server_model.load_state_dict(ckpt["model_state_dict"])
+    del(ckpt)
+    server_model = server_model.to(DEVICE).eval()
+    threading.Thread(target=worker_loop, daemon=True).start()
 
-# reload_server_model()
-
+    print(f"[INIT] deck={deck} ver={version} port={port} device={DEVICE}")
+    waitress.serve(app, host="127.0.0.1", port=port, threads=12)
 
 class Pending:
     __slots__ = ("idx", "off", "evt", "out", "req_id", "pre_count", "post_count", "t_recv", "t_done", "num_bags")
@@ -143,16 +104,13 @@ Q: "Queue[Pending]" = Queue(maxsize=4096)
 
 
 def worker_loop():
-    print(f"[INIT] Device={DEVICE}, torch threads={TORCH_THREADS}, "
-          f"model={MODEL}, ignore={IGNORE}")
-
     while True:
         p0 = Q.get()
         batch = [p0]
 
         # Collect more requests up to MAX_BATCH or MAX_WAIT_MS
         deadline = time.perf_counter() + (MAX_WAIT_MS / 1000.0)
-        while len(batch) < MAX_BATCH or not Q.empty():
+        while len(batch) < MAX_BATCH and not Q.empty():
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
                 remaining = 0
@@ -184,9 +142,8 @@ def worker_loop():
             off = (all_off + adjustments).to(DEVICE, non_blocking=True)
 
         # Single forward pass
-        with model_lock:
-            with torch.no_grad():
-                pA, pB, tgt, bin2, val = server_model(idx, off)
+        with torch.no_grad():
+            pA, pB, tgt, bin2, val = server_model(idx, off)
 
         # Move to CPU once
         pA = pA.cpu()
@@ -221,7 +178,7 @@ def worker_loop():
             p.t_done = time.perf_counter()
             p.evt.set()
 
-        print(f"[BATCH] size={len(batch)}, total_bags={row}")
+        # print(f"[BATCH] size={len(batch)}, total_bag_size={row}")
 
 
 threading.Thread(target=worker_loop, daemon=True).start()
@@ -239,13 +196,13 @@ def evaluate():
     offsets = data.get("offsets", [])
     pending = Pending(req_counter, indices, offsets)
 
-    print(f"[REQ {pending.req_id}] indices={pending.pre_count}, kept={pending.post_count}, bags={pending.num_bags}")
+    # print(f"[REQ {pending.req_id}] indices={pending.pre_count}, kept={pending.post_count}, bag_size={pending.num_bags}")
 
     Q.put(pending)
     pending.evt.wait()
 
     total_ms = (pending.t_done - pending.t_recv) * 1000.0
-    print(f"[REQ {pending.req_id}] done: {total_ms:.1f}ms")
+    # print(f"[REQ {pending.req_id}] done: {total_ms:.1f}ms")
 
     return Response(msgpack.packb(pending.out, use_bin_type=True), mimetype="application/x-msgpack")
 
@@ -254,27 +211,14 @@ def evaluate():
 def healthz():
     return "ok", 200
 
-@app.post("/reload")
-def reload_endpoint():
-    reload_server_model()
-    return {
-        "status": "reloaded",
-        "deck": DECK_NAME,
-        "version": VER_NUMBER,
-        "model": MODEL,
-        "ignore": IGNORE,
-    }, 200
-
-@app.post("/load")
-def load_endpoint():
-    print('Received request to load new model weights')
-    path = request.json.get("path")
-    if not path:
-        return {"error": "Path is required"}, 400
-    load_server_weights(path)
-    return {"status": "loaded"}, 200
 
 if __name__ == "__main__":
-    host = os.environ.get("MAGEZERO_SERVER_HOST", "127.0.0.1")
-    port = int(os.environ.get("MAGEZERO_SERVER_PORT", "50052"))
-    app.run(host=host, port=port, threaded=True)
+    import argparse
+    import waitress
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--deck", required=True)
+    parser.add_argument("--version", type=int, required=True)
+    parser.add_argument("--port", type=int, default=50052)
+    args = parser.parse_args()
+    print('Starting server asdf')
+    init(args.deck, args.version, args.port)

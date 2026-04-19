@@ -1,279 +1,302 @@
+# MageZero Setup Guide
 
-## **1. System Requirements**
+This guide walks you through installing MageZero and training your first deck-local RL agent.
 
-### **Hardware (minimum / recommended)**
-
-* **Minimum:** any quad-core CPU + 16GB RAM
-* **Recommended:** 8–16 cores + 32–64GB RAM (MCTS is CPU heavy)
-* **GPU:** NVIDIA card w/ 8GB+ VRAM (for model training)
-* **Disk:** ~25GB for XMage + logs + model checkpoints (40GB+ recommended)
-
-### **Software**
-
-* Windows or Linux
-* Java 21+
-* IntelliJ (strongly recommended for XMage)
-* Python 3.10 or later
-* PyTorch (with CUDA)
-* Git
+If you just want to run a trained model against your own deck in XMage, see the Play section at the bottom. This guide assumes you're here to train.
 
 ---
 
-## **2. Repository Structure**
+## 1. System Requirements
 
-* `/` — PyTorch model code, dataset utilities, training scripts
-* `/data/` — XMage generated HDF5 datasets per deck
-* `/models/` — trained models per deck/ver
-* `/stats_out/` — generated histograms and graphs from dataset files
+### Hardware
+
+| | Minimum | Recommended |
+|---|---|---|
+| CPU | 4 cores | 8–16 cores |
+| RAM | 16 GB | 32–64 GB |
+| GPU | — | NVIDIA, 8 GB+ VRAM |
+| Disk | 25 GB free | 40 GB+ |
+
+MCTS is CPU-heavy. Training uses the GPU. Both can run on one machine.
+
+### Software
+
+- Windows or Linux (Windows tested, Linux support in progress)
+- Java 21+
+- Python 3.10+
+- PyTorch with CUDA ([install guide](https://pytorch.org/get-started/locally/))
+- Git
 
 ---
 
-## **3. Installing XMage fork**
+## 2. Install MageZero
 
-### **3.1 Clone the XMage fork**
-
-```
-git clone https://github.com/WillWroble/mage
-```
-
-### **3.2 Import XMage into IntelliJ**
-
-* Open IntelliJ → "Import Project" → select `/mage/`
-* Make sure Maven syncs
-* Ensure Java 21 is installed and selected as SDK
-
-### **3.3 Build maven project**
-
-see https://github.com/magefree/mage/wiki/Setting-up-your-Development-Environment
-
-* increase compiler's heap size to 1500 or 3000 MB by Settings -> Build -> Compiler -> Build process heap size
-* run maven clean and install 
-* with Intellij maven: execute Mage root/lifecycle/clean and Mage root/lifecycle/install under maven project (M on right column)
-* build the project (can take 30min+)
----
-
-## **4. Running AI vs AI Simulations (Dataset Generation)**
-
-### **4.1 How to add Decks**
-* export the deck(s) you want to use as text from Moxfield, MTGO, MTGA or similar
-* convert your deck as a `.dck` file either using XMage's client deckbuilder, or from a text file using `TxtToDckConversionTest.java`
-* add the created .dck files to `\Mage.Tests\deck`
-* sideboard not supported yet
-
-### **4.2 Where to Configure Matchups**
-
-Right now all RL self play sessions are executed from JUnit tests in `Mage.Tests/src/java/../AI/RL`
-The root test harness is at `ParallelDataGenerator.java` most parameters you'll need to change will be static fields at the top of this file 
-(replace the defaults as you see fit, especially `MAX_CONCURRENT_GAMES` - don't go beyond 8 to avoid cache contention unless you have a supercomputer)
-Most relevant RL parameters are in this file, but if you want to change the more in-depth MCTS parameters, go to `ComputerPlayerMCTS.java` (the most relevant of
-which being `MAX_TREE_VISITS` which is the budget for the tree search, only lower if games are way too slow) 
-
-There are 2 main data generation configurations for RL right now:
-* `SimulateRLvsMinimax.java` (recommended to start) this is for playing games against XMages minimax AI (mad bot). 
-the mad bot is much faster and weaker and recommended to start with for initial training.
-* `SimulateRLVsRL.java` (advanced) this is for playing games against another MCTS RL bot. this requires having 2 different MageZero network servers running
-and is extremely Memory, CPU and GPU intensive. Right now we are trying to make a database of high quality pre-trained deck-local models for an initial opponent pool. 
-for now, you will have to use your own models or models I've shared in the public drive folder.
-
-
-
-### **4.3 Running Simulations**
-
-
-* Make default run configuration for JUnit tests. this is hardware dependent, but it is recommended to set heap as high as possible
-and use ZGC. 
-to do this in Intellij: run configurations > edit configurations > edit config templates > 
-JUnit > add VM options > `-Xms2g -Xmx24g -XX:+UseZGC --add-opens=java.base/java.lang=ALL-UNNAMED`
-
-To start learning the pipeline I recommend fixing a single minimax matchup in `SimulateRLvsMinimax.java` to do this:
-
-* in setup() at the top of the file, change `DECK_A` to be the name of the deck you want your RL agent to play. change `DECK_B` to be 
-the opponent's deck. (decks names shouldn't include the .dck , example: 
-```
-    DECK_A = "my_imported_deck";
-    DECK_B = "MTGA_MonoR;"
-```
-**PlayerA always refers to the player you are training the network for, PlayerB is always the opponent**
-* also optionally change RL parameters and settings here as you see fit. (I recommend keeping defaults and keeping `DONT_USE_POLICY` to true until you network's 
-priority A accuracy is >70% which can take 1-3 1000 game gens). Always have `DONT_USE_POLICY_TARGET` set to true for now 
-* go to `createTrainDataSet()` change `NUM_GAMES_TO_SIMULATE` as you see fit and run the JUnit test
-* since no inference server is running the agent will fall back to offline mode, which uses a heuristic value function and uniform policy
-* *Optional-Recommended* - get `grep` extension for IntelliJ and use it on output console to filter output per thread
-* When this completes it will generate `.hdf5` files under `Mage.Tests/training` make sure to save these files before starting a new run (they are overridden each time)
-
-
-## **5. Python Environment Setup (Training Pipeline)**
-
-### **5.1 Clone MageZero repo**
+### 2.1 Clone the repo
 
 ```
 git clone https://github.com/WillWroble/MageZero
-```
-
-### **5.2 Create Virtual Environment**
-
-use conda or your ML package manager of choice
-```
 cd MageZero
-python -m venv .venv
-.venv/bin/activate
-pip install -r requirements.txt
+```
+
+### 2.2 Download the XMage distribution
+
+Go to the [latest release](https://github.com/WillWroble/MageZero/releases/latest) and download `magezero-xmage-v0.1.0-alpha.zip`. Extract it into the repo root so you end up with an `xmage/` folder containing `lib/`, `mz-xmage.bat`, `mz-xmage.sh`, and `log4j.properties`.
 
 ```
-you'll probably need to do the torch install yourself for your CUDA/hardware see `https://developer.nvidia.com/cuda-downloads`
+MageZero/
+├── xmage/          ← from the release zip
+│   ├── lib/
+│   ├── mz-xmage.bat
+│   ├── mz-xmage.sh
+│   └── log4j.properties
+├── src/
+├── configs/
+└── ...
+```
 
-### **5.3 GPU Check**
+You do not need to clone or build XMage from source. The release ships a precompiled JAR with all dependencies bundled.
+
+### 2.3 Create a virtual environment
+
+```
+python -m venv .venv
+```
+
+Windows:
+```
+.venv\Scripts\activate
+```
+
+Linux:
+```
+source .venv/bin/activate
+```
+
+### 2.4 Install MageZero
+
+```
+pip install -e .
+```
+
+This installs the `mz` command globally in your venv and pulls all Python dependencies from `pyproject.toml`.
+
+Verify it worked:
+```
+mz --help
+```
+
+You should see the list of subcommands: `train`, `batch`, `play`, `import`, `export`.
+
+### 2.5 GPU check
 
 ```
 python -c "import torch; print(torch.cuda.is_available())"
 ```
 
+Should print `True`. If `False`, install the CUDA-matched PyTorch wheel from the link above — the default pip install often gives you the CPU-only build.
+
 ---
 
-## **6. Training a Deck Model**
+## 3. Add a Deck
 
-### **6.1 Organize the Data**
+Training is deck-local. You need at least one deck to train and one or more decks for your agent to train against.
 
-When adding your XMage data make sure to add it according to this file structure. 
-`data/<DECK-NAME>/ver<VERSION-NUMBER>/training/<YOUR-DATA-FILES>.hdf5`
-(you might need to create these folders yourself) example:
+### 3.1 Convert your deck to .dck format
+
+Export your deck from Moxfield, MTGA, or MTGO as plain text. Use the XMage client's deck builder (or any `.txt` → `.dck` converter) to produce a `.dck` file.
+
+Sideboards are not yet supported.
+
+### 3.2 Drop it in
 
 ```
-data/
-    UWTempo/
-        ver7/
-            training/
-                *.hdf5
-```
-it's also recommended to add a separate .hdf5 data file under `../testing/` to eval your model's performance (value loss should be < 0.1) 
-### **6.2 Configure Training Options**
-
-Navigate to the editable constants at the top of `train.py`:
-
-* `DECK_NAME`
-* `VER_NUMBER`
-* `EPOCH_COUNT`
-* `USE_PREVIOUS_MODEL`
-
-* change DECK_NAME and VER_NUMBER to correspond to where you put your training data in the file structure.
-* change EPOCH_COUNT and USE_PREVIOUS_MODEL as you see fit (60 recommended for starting with random weights, 10 for model reuse)
-* also optionally change `PRIORITY_A_MAX` `PRIORITY_B_MAX` `TARGETS_MAX` with the max index of the action mapping generated in XMage (will be printed at the
-start of each RL run) this slightly improves network performance by properly normalizing loss
-
-
-### **6.3 Run Training**
-
-```
-python train.py
+MageZero/xmage/decks/MyDeck.dck
 ```
 
+The filename (without `.dck`) is what you'll reference everywhere else — in configs, on the command line, in the data/model folder names. Pick something without spaces.
 
-* Starts reading shards
-* does some preprocessing to automatically save and generate an ignore list/mask over feature indices
-* Reports loss on test set (if provided) for value + policy heads per epoch
-* automatically saves final model and ignore list to `models/<DECK-NAME>/ver<VER-NUM>/`
-* old models are automatically overridden, if you want to be able to go back to a prev model bump version number
+A handful of reference decks are included in `xmage/decks/` out of the box for opponents — monocolored Standard decks. You can add your own or use those.
 
 ---
 
-## **7. Running the Inference Server**
+## 4. Configure Your Run
 
-### **7.1 Start the server**
+Open `configs/run.yml`. This is the main file you'll edit.
 
-all fields you set in `train.py` are reused here 
+```yaml
+deck: MyDeck
+version: 1
+start_from_version: null
 
-run:
+generations: 6
+games_per_gen: 200
+replay_buffer_gens: 3
+
+opponents:
+  - deck: Standard-MonoR
+    mode: minimax
+  - deck: Standard-MonoG
+    mode: minimax
+
+training:
+  analyze_dataset: true
+  generate_plots: true
+  eval_previous_model: true
+
+log_level: ACTIONS
+curriculum: configs/curriculum.yml
 ```
-waitress-serve --host=127.0.0.1 --port=50052 --threads=6 server:app
+
+Fields worth knowing:
+
+- **`deck`** — the deck you're training. Must match a file at `xmage/decks/<deck>.dck`.
+- **`version`** — the version number for this training run. Defaults to 1. Increment if you want to start fresh without overwriting a previous run's models and data.
+- **`start_from_version`** — set to a previous version number to start training from that checkpoint instead of offline bootstrap. Leave as `null` for a first-time run.
+- **`generations`** — how many full self-play / train / eval cycles to run.
+- **`games_per_gen`** — how many games per opponent per generation.
+- **`replay_buffer_gens`** — how many past generations of data to train on. Older data gets archived automatically.
+- **`opponents`** — list of decks to play against. `mode` is `minimax` (fast, heuristic bot) or `mcts` (full MCTS with its own trained model). Start with `minimax` for initial training.
+
+### Curriculum (optional)
+
+`configs/curriculum.yml` controls hyperparameter annealing across generations. The defaults are reasonable — you don't need to touch this unless you want to tune the schedule. See comments in the file for details.
+
+### Game parameters (optional)
+
+`configs/game.yml` controls XMage-side parameters the runner passes through (search budget, threads, MCTS timeout, hidden info toggle, etc.). Edit if you want to tweak the engine, but the defaults work.
+
+---
+
+## 5. Train
+
 ```
-(port is automatically set to 50052 in XMage, use 50053 for an opponent model if doing RL vs RL)
+mz train
+```
 
-### **7.2 XMage → Python communication**
+That's the whole command. `mz train` will:
 
-Explained briefly:
+1. Create a run folder under `runs/<timestamp>/`
+2. For each generation:
+   - Launch the primary Python inference server (or run offline for gen 0)
+   - For each opponent: start/stop its server if needed, launch XMage via the JAR, generate games
+   - Run dataset stats on the new data (saves plots)
+   - Evaluate the previous generation's model on the new data (gen 1+)
+   - Move new data from `testing/` to `training/`
+   - Archive out-of-window training data
+   - Train the next model (50 epochs bootstrap, 10 epochs from checkpoint)
+3. Mark the run as complete
 
-* XMage calls HTTP endpoint
-* Server returns policy + value
-* GPU needed to run inference hundreds of times per second during online simulations
-* should see ~50 Evals/sec per thread on average.
+The terminal shows XMage game logs in real time. Python-side output (training loss, dataset stats, test accuracy) is captured in per-run log files instead of flooding your terminal.
 
-once the server is running, start your RLvsMinimax run in XMage like before, it should find the endpoint and use the 
-network now (performance might be slightly worse after one gen, perf should go up a lot in gen 2, 3 and 4 using NUM_GAMES = 1000)
+### Resume an interrupted run
 
-* once the new data is generated *add* the new .hdf5 to the directory with the old .hdf5s. don't replace old training data 
-unless you have 5000+ games of newer data, and you're reusing the network. 
-* you can also run `dataset_stats.py` if you want to see histograms/plots for the datasets generated by XMage.
-* train the new model with `train.py` like before
-* close the old server and rerun it with new model (automatically updated by train.py)
-* start gen 2 in XMage and continue the self play loop. It is highly recommended that you monitor network and agent performance
-as you go, tweaking/annealing values as you see fit. Decks in MTG vary a lot, and this is far from a complete system. Enjoy :)
+If `mz train` is interrupted (Ctrl+C, crash, power outage), the next time you run it it'll detect the incomplete run and ask:
 
+```
+Active run found: 2026-04-09_14-23-42. Resume? [Y/n]
+```
 
----
+Answer `Y` to pick up where you left off. Answer `n` to abandon it and start fresh — the abandoned run is marked in its `run.json` but never deleted, so the history is preserved.
 
+### What gets produced
 
+```
+data/MyDeck/ver1/
+├── testing/                 ← new data arrives here first
+├── training/                ← active training buffer
+└── archive/                 ← out-of-window data
 
-## **8. Evaluating**
+models/MyDeck/ver1/
+├── model.pt.gz              ← latest checkpoint
+├── ignore.roar              ← feature ignore list
+└── state.json               ← deck session counter
 
+plots/MyDeck/ver1/
+├── value_hist_*.png
+├── avg_policy_*.png
+└── idx_dist_*.png
 
-### **8.1 Output**
+runs/2026-04-09_14-23-42/
+├── run.json                 ← full run history
+├── train.log                ← all gens, appended
+├── test.log
+├── dataset_stats.log
+└── server_50052.log
+```
 
-* 'Composite children': the MCTS visit distributions for possible actions at current decision point.
-should be flat at first and become more spikey later on.
-* 'Actions:' the visit counts and MCTS pooled Q value (score) from (-1,1) for each possible action
-example: `INFO  2025-11-23 19:03:49,433 PRECOMBAT_MAIN0 actions: [Play Adarkar Wastes score: 0.960 count: 42] [Play Meticulous Archive score: 0.953 count: 44] [Play Island score: 0.972 count: 67] [Pass score: 0.985 count: 146]  =>[pool-10-thread-1] MCTSNode.bestChild 
-`
-* evaluations/sec corresponds to how many network inferences are happening per sec for that thread
-example: `INFO  2025-11-23 19:07:36,018 Total: simulated 17443 evaluations in 306.3927939919999 seconds - Average: 56.930190076387525 =>[pool-10-thread-3] ComputerPlayerMCTS2.applyMCTS 
-` means you are exploring and evaluating 56 possible futures/sec per thread. if lower than 40 consider lowering `MAX_CONCURRENT_GAMES`
-* WR data is saved to `Mage.Tests/train_results.txt` you can also view it live with a grep filter for 'WR:' on console
-### **8.2 Best Practices**
-
-* Use ≥200 games per matchup
-* Compare WR across generations
-* Never trust <100 games for WR
-
----
-## **9. Human vs RL**
-
-You can play against your trained RL agent using the XMage Client, To do so:
-
-1. make intelliJ run configuration for both XMage server and client. (see XMage dev guide https://github.com/magefree/mage/wiki/Setting-up-your-Development-Environment)
-2. run the server on localhost (default) if you get db errors delete the `.db` files in the server and/or client module and run again
-3. run the client and connect to your local server.
-4. choose `create bot match` button in the GUI, and under the opponent AI dropdown select `MageZero`. choose your decks (`.dck` files and start the match). Make sure you have the pytorch server running in the backround like for training. 
----
-
-## **10. Troubleshooting / Common Issues**
-
-* **`Couldn't load deck, deck size=0`** - this error can happen for many reasons; the most likely being that the cardpool (mage-sets) isn't building/compiling properly. Clean and rebuild the maven project until you confirm mage-sets built without errors. make sure to rebuild with -DskipTests=true like in XMage setup guide.
-* **`Could not create Virtual env` or other GC errors** - this means ZGC is not compatible with your hardware, use G1GC instead (remove `-XX:+UseZGC` from run config, G1GC should be default)
-* **run starts but gets stuck midway through** - likely hdf5 file writing error. make sure you have ample disk space, correct output path `DATA_OUT_FILE_A` and >20 evals/sec from game logs.
-
----
-## **11. Limitations**
-
-* Many niche abilities in MTG (enter the dungeon, controlling opponents turn, pre game decisions)
-These should work in XMage but will be invisible to the RL agent. (If you are a contributor looking to change that look at `StateEncoder.java`)
-* Mulligan and side boarding turned off for simplicity right now.
-* Hidden info, turned off by default for less noisy testing and model evaluations. Both players play with perfect info.
-* Human vs AI support. currently being worked on.
-* Manual mana payment. manual mana payment explodes the branching factor of MTG, for scalability we use XMages 
-built in auto tapper to handle mana payment. (non mana costs are still simulated out in the MCTS tree). This also means
-activating mana sources with nothing to pay for isn't available to the agent (can be relevant in niche situations)
-* Niche micro decisions (i.e. ordering triggered abilities, choosing replacement effects, assigning damage) these aren't
-conceptually a problem but just don't come up enough to justify implementation yet.
+Every run is fully self-contained under `runs/`. You can grep across a run's full training history with `grep foo runs/2026-04-09_14-23-42/train.log`.
 
 ---
 
+## 6. Monitor a Run
 
-## **12. Contact & How to Get Involved**
+Training can take hours. Watch progress live from another terminal:
 
+```
+# Tail the training output
+Get-Content runs\<run_id>\train.log -Wait -Tail 20
 
-* Discord: `inkling_6`
-* Email: `willwroble@gmail.com`
-* Contributions wanted: Java performance, network testing, new decks, XMage bug hunting. **see [FAQ](https://github.com/WillWroble/MageZero/blob/main/faq_goals.md)**
+# Watch data files appear
+dir data\MyDeck\ver1\testing
+```
+
+The `run.json` file is updated after every gen with the current stage (`generate`, `analyze`, `eval`, `move`, `train`) — check it to see what the runner is doing right now.
 
 ---
 
+## 7. Other Commands
 
+### `mz batch`
+Launch a single XMage data generation run using `configs/game.yml` directly. No orchestration, no training — just XMage. Useful for manual experiments outside the curriculum pipeline.
+
+```
+mz batch --config configs/game.yml
+```
+
+### `mz import <file>`
+Auto-detects file type:
+- `.dck` → copies to `xmage/decks/`
+- `.mz` → unpacks to `models/<deck>/ver<N>/`
+- `.txt` → not yet wired up, convert manually for now
+
+```
+mz import path/to/mydeck.dck
+```
+
+### `mz export`
+Pack a trained model into a shareable `.mz` bundle.
+
+```
+mz export --deck MyDeck --version 3
+```
+
+Produces `exports/MyDeck_v3.mz` containing the model, ignore list, and metadata.
+
+### `mz play` (stub)
+Host a local AI player for the XMage client to connect to. Not yet implemented.
+
+---
+
+## 8. Troubleshooting
+
+**`mz train` hangs at "Loading database..."** — First launch builds the H2 card database from scratch. Takes ~1 minute. Subsequent runs skip this.
+
+**`HDF5FileNotFoundException: Directory does not exist`** — The runner creates parent directories automatically, but `mz batch` with a custom `output_file` does not. Create the parent folder manually or use `mz train` instead.
+
+**`Failed to establish connection to network model`** — The Java side couldn't reach the Python server. Check that `server_50052.log` in your run folder shows the server started successfully. If the server failed, runner would have aborted — so this warning is usually benign and means the JVM launched before the server was fully ready. Not a problem, servers have a 600s warmup window.
+
+**`java.lang.OutOfMemoryError`** — Lower `games_per_gen` or reduce `MAX_CONCURRENT_GAMES` in the XMage source. Default heap is `-Xmx24g` in `mz-xmage.bat`; bump it up if you have more RAM.
+
+**Couldn't load deck, deck size=0** — Card set jar missing or corrupt. Redownload the XMage distribution zip from the release page and re-extract.
+
+**ZGC not supported** — Edit `xmage/mz-xmage.bat` and remove `-XX:+UseZGC`. G1GC (the default) will be used instead, slightly slower but works everywhere.
+
+---
+
+## 9. Contact
+
+- Discord: `inkling_6`
+- Discord server: [https://discord.gg/R6pB6xuEy9](https://discord.gg/R6pB6xuEy9)
+- Email: `willwroble@gmail.com`
+
+Bug reports, feature requests, and "how do I..." questions are all welcome.

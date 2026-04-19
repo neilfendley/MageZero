@@ -8,19 +8,39 @@ This approach reframes the challenge of MTG AI from universal mastery to local o
 
 ---
 
-### 2. Current Status (December 2025): **Learning-MCTS agent implemented in Parallel AIvsAI environment in XMage**
+### 2. Current Status (April 2026): **First public alpha released**
 
-This project uses [XMage](https://github.com/magefree/mage), an Open Source complete MTG rules engine as a gym environment. See this project's [XMage fork](https://github.com/WillWroble/mage) for the State vectorization and MCTS logic. (relevant modules: `Player.AI.RL`, `Player.AI.MCTS`, `Tests/src/java/org.mage.test/AI/RL`)
+MageZero v0.1.0-alpha is available on the [releases page](https://github.com/WillWroble/MageZero/releases/latest). This includes a precompiled XMage distribution and the `mz` CLI for running full training curricula end-to-end.
 
-The core infrastructure for MageZero is complete and undergoing testing. The full end-to-end pipeline from simulation and data generation in Java to model training in PyTorch and back to inference via local python server is functional.
+The project uses [XMage](https://github.com/magefree/mage), an Open Source complete MTG rules engine, as a gym environment. See this project's [XMage fork](https://github.com/WillWroble/mage) for the state vectorization and MCTS logic (relevant modules: `Player.AI.RL`, `Player.AI.MCTS`, `Mage.MageZero`).
 
-The first alpha release (with precompiled XMage module) is planned for early February.
+See the [setup guide](https://github.com/WillWroble/MageZero/blob/main/setup_guide.md) for full installation and training instructions. For questions, join the Discord at [discord.gg/R6pB6xuEy9](discord.gg/R6pB6xuEy9) or reach me at <willwroble@gmail.com>.
 
-If you are interested in contributing or running locally see the [setup guide](https://github.com/WillWroble/MageZero/blob/main/setup_guide.md). I am also always available at <willwroble@gmail.com>
+Also see [FAQ and future goals](https://github.com/WillWroble/MageZero/blob/main/faq_goals.md).
 
+---
+### Quick Start
+```bash
+# Clone the repo
+git clone https://github.com/WillWroble/MageZero
+cd MageZero
 
-also see [FAQ and future goals](https://github.com/WillWroble/MageZero/blob/main/faq_goals.md)
+# Download the XMage distribution from the latest release and extract into the repo root
+# (creates xmage/ folder)
 
+# Set up Python environment
+python -m venv .venv
+source .venv/bin/activate     # Windows: .venv\Scripts\activate
+pip install -e .
+
+# Add your deck
+cp my_deck.dck xmage/decks/
+
+# Edit configs/run.yml to point at your deck, then
+mz train
+```
+
+That's the whole flow — one command drives data generation, dataset analysis, model evaluation, replay buffer management, and training across every generation in the curriculum. See the [setup guide](https://github.com/WillWroble/MageZero/blob/main/setup_guide.md) for details.
 ---
 
 ### 3. Self-Play Results (as of December 2025)

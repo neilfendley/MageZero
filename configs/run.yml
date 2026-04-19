@@ -1,0 +1,30 @@
+# run.yml — defines a single deck training run
+
+deck_pool: 
+  - MonoRAggro
+  - MonoGLandfall
+  - BantRhythm
+  - IzzetLessons
+  - JeskaiControl
+  - IzzetElementals
+  - IzzetProwess
+  - MonoWAggro
+  - IzzetSpellementals
+  - DimirMidrange
+
+mode: mcts
+version: 1
+start_from_version: null     # null = offline bootstrap, set to resume from checkpoint
+
+generations: 5
+games_per_gen: 32
+replay_buffer_gens: 10
+
+training:
+  analyze_dataset: true
+  generate_plots: true
+  eval_previous_model: true
+
+log_level: GAMEPLAY           # ALL | GAMEPLAY | ACTIONS | ERROR
+
+curriculum: configs/curriculum.yml

@@ -26,7 +26,9 @@ class H5Indexed(Dataset):
       (indices:int64[r], policy:float32[A], value:float32[1], is_player:float32[1], action_type:int64[1])
     """
 
-    def __init__(self, dir_path: str, ignore: set[int] | None = None, deck_name: str | None = None):
+    def __init__(self, dir_path: str, ignore: set[int] | None = None, deck_name: str | None = None, rollout: bool = False, rollout_len: int = 5):
+        self.rollout = rollout
+        self.rollout_len = rollout_len
         p = Path(dir_path)
         h5_paths = sorted(list(p.glob("**/*.h5")) + list(p.glob("**/*.hdf5")))
         decks_to_use = []
@@ -128,10 +130,25 @@ class H5Indexed(Dataset):
         isP_t = torch.ones(1)
         aType_t = row_k[A + 3].to(torch.long).unsqueeze(0)  # int64 [1]
 
+        if self.rollout:
+            rollout_rewards = []
+            action_types = []
+            for i in range(1, self.rollout_len + 1):
+                idx = k + i
+                if idx < self.N:
+                    reward = self.row_t[idx, A + 0].item()
+                    rollout_rewards.append(reward)
+                    action_types.append(self.row_t[idx, A + 3].to(torch.long).unsqueeze(0))
+                else:
+                    rollout_rewards.append(rollout_rewards[-1] if rollout_rewards else 0.0)  # pad with last reward or 0 if no rewards
+                    action_types.append(action_types[-1] if action_types else torch.tensor(0, dtype=torch.long).unsqueeze(0))  # pad with last action type or 0
+            return sv_idx_t, policy_t, value_t, isP_t, aType_t, rollout_rewards, action_types
+
         return sv_idx_t, policy_t, value_t, isP_t, aType_t
 
 def collate_batch(batch):
     n = len(batch)
+    has_rollout = len(batch[0]) == 7
     lens = [b[0].numel() for b in batch]
     total = int(sum(lens))
 
@@ -139,7 +156,8 @@ def collate_batch(batch):
     offsets = torch.empty(n, dtype=torch.long)
 
     p = 0
-    for i, (ix, _, _, _, _) in enumerate(batch):
+    for i, b in enumerate(batch):
+        ix = b[0]
         L = ix.numel()
         if L: idxs[p:p+L].copy_(ix)              # bulk copy
         offsets[i] = p
@@ -152,6 +170,11 @@ def collate_batch(batch):
     values       = torch.stack([b[2] for b in batch], 0)
     is_players   = torch.stack([b[3] for b in batch], 0)
     action_types = torch.stack([b[4] for b in batch], 0)
+
+    if has_rollout:
+        rollout_rewards = torch.tensor([b[5] for b in batch], dtype=torch.float32)
+        action_types_rollout = torch.tensor([b[6] for b in batch], dtype=torch.long)
+        return idxs, offsets, policies, values, is_players, action_types, rollout_rewards, action_types_rollout
 
     return idxs, offsets, policies, values, is_players, action_types
 
@@ -166,7 +189,8 @@ def create_redundancy_ignore_list(ds, k=10) -> Set[int]:
     num_samples = 0
 
     # single pass: collect which samples contain each feature
-    for (idxs, _, _, _, _) in tqdm(ds):
+    for b in tqdm(ds):
+        idxs = b[0]
         idxs_np = idxs.cpu().numpy().astype(np.int32, copy=False)
         for feature_idx in idxs_np:
             feature_idx_int = int(feature_idx)
@@ -210,7 +234,8 @@ def filter_one_hots(dataset):
 
 
     for i in range(n):
-        _, policy, _, _, _ = dataset[i]  # (indices, policy, value)
+        b = dataset[i]
+        policy = b[1]
         # policy is a FloatTensor of shape [A]
         # treat near-zeros as zero via eps
         nonzero = (policy > 0).sum().item()
@@ -234,8 +259,10 @@ def filter_opponent_states(dataset, targets_max):
 
 
     for i in range(n):
-        _, policy, _, is_player, d_type = dataset[i]  # (indices, policy, value, isPlayer, decision type)
-        if is_player:
+        b = dataset[i]
+        is_player = b[3]
+        d_type = b[4]
+        if not ((not is_player) and d_type == 0) : #keep anything but opponent priorities
             keep_states.append(i)
 
 
